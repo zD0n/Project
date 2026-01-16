@@ -1,6 +1,7 @@
 # Vision Transformer
 import torch
-from torch import nn, optim
+from torch import nn
+
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 
@@ -114,11 +115,13 @@ class Transformer(nn.Module):
         self.norm = nn.LayerNorm(dim)
         self.layers = nn.ModuleList([])
 
+
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
-                Attention(dim, heads = heads, dim_head = dim_head, dropout = dropout),
-                FeedForward(dim, mlp_dim, dropout = dropout)
+                LocalAttention(dim, heads=heads, dim_head=dim_head, window_size=3, dropout=dropout),
+                FeedForward(dim, mlp_dim, dropout=dropout)
             ]))
+
 
     def forward(self, x):
         for attn, ff in self.layers:
