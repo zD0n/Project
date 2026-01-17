@@ -6,82 +6,78 @@ import librosa
 import numpy as np
 import torch.nn.functional as F
 from torch.utils.data import TensorDataset
+import pandas as pd
 
-def scatter(mapping,path2folder):
-    # ===========================
-    # Parameters
-    # ===========================
+def preprocess(mapping,path):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    """
+    ---------
+    """
+
+    contents = os.listdir(path)
+    for i in contents:
+        if i.endswith(".csv"):
+            label_file = f"{path}\{i}".replace("\\", "/")
+        else:
+            data_dir = f"{path}\{i}".replace("\\", "/")
+    emotion_map = mapping
+
+    labels_df = pd.read_csv(label_file)
+    """
+    ---------
+    """
+    X_list = []
+    y_list = []
+
     T = 16000          # 1 second of audio at 16kHz
     J = 6              # scattering scale
     Q = 8              # wavelets per octave
-    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Initialize scattering
     scattering = Scattering1D(J=J, shape=T, Q=Q, frontend='torch')
     scattering = scattering.to(device)
 
-    # ===========================
-    # Paths
-    # ===========================
-    audio_dir = r"C:\Coding\emodb\wav"  # folder containing your audio files
 
-    # ===========================
-    # Collect all scattering features
-    # ===========================
-    vit_features = []
-    labels = []
 
-    emo_map = {
-        "W": "anger", "L": "boredom", "E": "disgust", "A": "fear",
-        "F": "happiness", "T": "sadness", "N": "neutral"
-    }
-    idx2label = {i: emo for i, emo in enumerate(sorted(emo_map.values()))}
-    label2idx = {v: k for k, v in idx2label.items()}
-
-    for filename in os.listdir(path2folder):
-        if not filename.lower().endswith(".wav"):
+    for idx, row in labels_df.iterrows():
+        filename = row['Filename'] + '.wav'
+        print("Current File Working : ",filename)
+        file_path = os.path.join(data_dir, filename)
+        
+        if not os.path.exists(file_path):
+            # print(f"File not found: {file_path}")
+            continue
+        
+            
+        emotion = row['Label'].lower()
+        if emotion not in emotion_map:
+            # print(f"Skipping unknown emotion: {emotion}")
             continue
 
-        audio_path = os.path.join(path2folder, filename)
-        # print(f"Processing {filename} ...")
-
-        # ---------------------------
-        # Load audio
-        # ---------------------------
-        y, sr = librosa.load(audio_path, sr=16000)  # force 16kHz
+        y, sr = librosa.load(file_path, sr=16000)  # force 16kHz
         if len(y) < T:
             y = np.pad(y, (0, T - len(y)))
         else:
             y = y[:T]
 
-        # ---------------------------
-        # Scattering transform
-        # ---------------------------
         x = torch.tensor(y, dtype=torch.float32).unsqueeze(0).to(device)  # [1, T]
         Sx = scattering(x)  # [1, channels, time]
 
-        # ---------------------------
-        # Prepare for ViT: resize to 256x256 and repeat channels
-        # ---------------------------
         Sx = Sx.unsqueeze(1)  # [1, 1, channels, time]
-        Sx_resized = F.interpolate(Sx, size=(256, 256), mode="bilinear")
-        Sx_resized = Sx_resized.repeat(1, 3, 1, 1)  # [1, 3, 256, 256]
+        Sx_resized = F.interpolate(Sx, size=(64, 128), mode="bilinear")
+        Sx_resized = Sx_resized.repeat(1, 1, 1, 1)  # [1, 3, 256, 256]
         Sx_resized = Sx_resized.squeeze(0)          # [3, 256, 256]
 
-        vit_features.append(Sx_resized.cpu())
+        X_list.append(Sx_resized.cpu())
+        y_list.append(emotion_map[emotion])
 
-        # ---------------------------
-        # Label from filename
-        # EMODB normal format: 03a01Fa.wav → 'F'
-        # ---------------------------
-        emo_code = filename[5]
-        labels.append(label2idx[emo_map[emo_code]])
-
+        
+    print("Total samples loaded:", len(X_list), len(y_list))
     # ===========================
     # Final dataset tensors
     # ===========================
-    X = torch.stack(vit_features)  # [num_samples, 3, 256, 256]
-    y = torch.tensor(labels)       # [num_samples]
+    X = torch.stack(X_list)  # [num_samples, 3, 256, 256]
+    y = torch.tensor(y_list)       # [num_samples]
 
     print("Final dataset shapes:")
     print("  X:", X.shape)

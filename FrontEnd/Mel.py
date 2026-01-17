@@ -8,13 +8,18 @@ from torch.utils.data import TensorDataset
 
 import pandas as pd
 
-def preprocess(mapping,path2audio,path2label):
+def preprocess(mapping,path):
     """
     ---------
     """
-
-    data_dir = path2audio
-    label_file = path2label
+    # print(path)
+    contents = os.listdir(path)
+    # print(contents)
+    for i in contents:
+        if i.endswith(".csv"):
+            label_file = f"{path}\{i}".replace("\\", "/")
+        else:
+            data_dir = f"{path}\{i}".replace("\\", "/")
     emotion_map = mapping
 
     """
@@ -43,7 +48,7 @@ def preprocess(mapping,path2audio,path2label):
     """
     ---------
     """
-
+    # print(label_file)
     labels_df = pd.read_csv(label_file)
 
     X_list = []
