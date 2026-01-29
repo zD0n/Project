@@ -1,0 +1,14 @@
+# datasets & outputs
+Dataset
+results
+
+# python junk
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# git
+.git
+.gitignore
+.md

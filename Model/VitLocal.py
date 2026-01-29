@@ -98,7 +98,7 @@ class LocalAttention(nn.Module):
 
         out = []
         for i in range(n):
-            k_local = k[:, :, i:i+self.window_size, :]  # select local window
+            k_local = k[:, :, i:i+self.window_size, :]
             v_local = v[:, :, i:i+self.window_size, :]
             attn = torch.matmul(q[:, :, i:i+1, :], k_local.transpose(-1, -2)) * self.scale
             attn = self.attend(attn)

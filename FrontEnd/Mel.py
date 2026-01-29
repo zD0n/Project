@@ -9,6 +9,7 @@ from torch.utils.data import TensorDataset
 import pandas as pd
 
 def preprocess(mapping,path):
+    print("Im Loading Please wait for awhile.")
     """
     ---------
     """
