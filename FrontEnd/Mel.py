@@ -1,4 +1,4 @@
-# Mel 
+# Mel
 
 import librosa
 import torch
@@ -8,7 +8,8 @@ from torch.utils.data import TensorDataset
 
 import pandas as pd
 
-def preprocess(mapping,path):
+
+def preprocess(mapping, path):
     print("Im Loading Please wait for awhile.")
     """
     ---------
@@ -18,24 +19,21 @@ def preprocess(mapping,path):
     # print(contents)
     for i in contents:
         if i.endswith(".csv"):
-            label_file = f"{path}\{i}".replace("\\", "/")
+            label_file = rf"{path}\{i}".replace("\\", "/")
         else:
-            data_dir = f"{path}\{i}".replace("\\", "/")
+            data_dir = rf"{path}\{i}".replace("\\", "/")
     emotion_map = mapping
 
     """
     ---------
     """
+
     def extract_features(file_path, n_mels=64, max_len=128):
         y, sr = librosa.load(file_path, sr=None)
-        
+
         # compute Mel Spectrogram
-        mel_spec = librosa.feature.melspectrogram(
-            y=y,
-            sr=sr,
-            n_mels=n_mels
-        )
-        
+        mel_spec = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=n_mels)
+
         # convert to log scale (recommended)
         mel_spec = librosa.power_to_db(mel_spec, ref=np.max)
 
@@ -46,6 +44,7 @@ def preprocess(mapping,path):
             mel_spec = mel_spec[:, :max_len]
 
         return mel_spec
+
     """
     ---------
     """
@@ -56,19 +55,18 @@ def preprocess(mapping,path):
     y_list = []
 
     for idx, row in labels_df.iterrows():
-        filename = row['Filename'] + '.wav'
+        filename = row["Filename"] + ".wav"
         file_path = os.path.join(data_dir, filename)
-        
+
         if not os.path.exists(file_path):
             # print(f"File not found: {file_path}")
             continue
-        
-            
-        emotion = row['Label'].lower()
+
+        emotion = row["Label"].lower()
         if emotion not in emotion_map:
             # print(f"Skipping unknown emotion: {emotion}")
             continue
-        
+
         features = extract_features(file_path)
         X_list.append(features)
         y_list.append(emotion_map[emotion])
@@ -80,4 +78,3 @@ def preprocess(mapping,path):
     y = torch.tensor(np.array(y_list), dtype=torch.long)
 
     return TensorDataset(X, y)
-

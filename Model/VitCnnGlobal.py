@@ -128,7 +128,7 @@ class Transformer(nn.Module):
             x = ff(x) + x
         return self.norm(x)
 
-class ViTWithCNN(nn.Module):
+class ViT(nn.Module):
     def __init__(self, *, image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, pool='cls', channels, dim_head, dropout, emb_dropout, cnn_channels):
         super().__init__()
         image_height, image_width = pair(image_size)

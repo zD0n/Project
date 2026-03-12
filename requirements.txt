@@ -1,6 +1,6 @@
 torch >= 1.9.0
 torchaudio >= 0.9.0
-torch-audiomentations==0.9.0
+torch-audiomentations >= 0.11.0
 SoundFile==0.10.3.post1
 msgpack
 msgpack-numpy
@@ -10,3 +10,5 @@ lmdb
 pandas
 matplotlib
 einops
+librosa
+kymatio

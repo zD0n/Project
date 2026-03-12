@@ -255,8 +255,8 @@ with my_chdir(new_path):
 """
 print("Spliting Dataset")
 train_loader,test_loader = Create_Loader(dataset,batch_size=32)
-
 device = "cuda" if torch.cuda.is_available() else "cpu"
+print(device)
 num_epochs = 20
 
 """
