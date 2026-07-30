@@ -233,8 +233,7 @@ def test_model(model, test_loader, device, emotion_map, save_dir="./results"):
 
 result_dir = "./results"
 os.makedirs(result_dir, exist_ok=True)
-save_dir = f"{result_dir}/Experiment{len(os.listdir(result_dir))}"
-os.makedirs(save_dir, exist_ok=True)
+pipeline_root = "./pipeline_output"
 
 """
 IEMCAP
@@ -307,31 +306,19 @@ Model
 """
 
 
-"""
------------------- Replace Front End Here ------------------
-"""
-print("Setup preprocessor.")
-from FrontEnd import Leaf
+class PipelineFolderDataset(torch.utils.data.Dataset):
+    def __init__(self, folder_path):
+        self.samples = []
+        for f in sorted(os.listdir(folder_path)):
+            if f.endswith(".pt"):
+                data = torch.load(os.path.join(folder_path, f), weights_only=False)
+                self.samples.append(data)
 
-print("Preprocessing Datas")
+    def __getitem__(self, idx):
+        return self.samples[idx]
 
-new_path = os.path.join(os.getcwd(), "FrontEnd")
-
-dataset_path = "../Dataset2"
-processed_path = "./dataset_preprocessed/processed_dataset2_64_leaf.pt"
-
-if os.path.exists(processed_path):
-    print("Loading preprocessed dataset...")
-    dataset = torch.load(processed_path, weights_only=False)
-else:
-    with my_chdir(new_path):
-        dataset = Leaf.preprocess(mapping=emotion_map, path=dataset_path)
-    print("Saving preprocessed dataset...")
-    torch.save(dataset, processed_path)
-
-"""
--------------------------------------------------------------
-"""
+    def __len__(self):
+        return len(self.samples)
 
 
 class TransformDataset(torch.utils.data.Dataset):
@@ -362,64 +349,96 @@ class TransformDataset(torch.utils.data.Dataset):
         return len(self.subset)
 
 
-print("Spliting Dataset")
-train_loader, val_loader, test_loader = Create_Loader(dataset, batch_size=16)
-train_loader = DataLoader(
-    TransformDataset(train_loader.dataset), batch_size=16, shuffle=True
-)
-val_loader = DataLoader(
-    TransformDataset(val_loader.dataset), batch_size=16, shuffle=False
-)
-test_loader = DataLoader(
-    TransformDataset(test_loader.dataset), batch_size=16, shuffle=False
-)
+from Model import VitCnnLocal, VitGlobal
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(device)
 num_epochs = 50
 
-"""
------------------- Replace Model Here ------------------
-"""
-print("Setup Model.")
-from Model import VitCnnLocal
-
-print("Setup Parameter for Model")
-vit_model = VitCnnLocal.ViT(
-    image_size=(64, 64),
-    patch_size=(8, 8),
-    num_classes=len(emotion_map),
-    dim=256,
-    depth=6,
-    heads=8,
-    # dim_head=64,
-    cnn_channels=64,
-    mlp_dim=1024,
-    channels=4,
-    dropout=0.1,
-    emb_dropout=0.1,
-).to(device)
-
-# model.load_state_dict(torch.load("./result/model_best.pth"))
-# model.to(device)
-# model.eval()
-"""
--------------------------------------------------------------
-"""
-print("Training Model.")
-Model = train_model(
-    parameter=vit_model,
-    num_epochs=num_epochs,
-    device=device,
-    train_loader=train_loader,
-    val_loader=val_loader,
-    save_dir=save_dir,
+folders = sorted(
+    [
+        d
+        for d in os.listdir(pipeline_root)
+        if os.path.isdir(os.path.join(pipeline_root, d))
+    ]
 )
 
-print("Testing Model.")
-test_model(
-    model=Model,
-    test_loader=test_loader,
-    device=device,
-    emotion_map=emotion_map,
-    save_dir=save_dir,
-)
+for folder_name in folders:
+    folder_path = os.path.join(pipeline_root, folder_name)
+    print(f"\n{'=' * 50}")
+    print(f"Processing: {folder_name}")
+    print(f"{'=' * 50}")
+
+    save_dir = os.path.join(result_dir, folder_name)
+    os.makedirs(save_dir, exist_ok=True)
+
+    print(f"Loading dataset from {folder_path}...")
+    dataset = PipelineFolderDataset(folder_path)
+    print(f"Loaded {len(dataset)} samples")
+
+    print("Splitting Dataset")
+    train_loader, val_loader, test_loader = Create_Loader(dataset, batch_size=16)
+    train_loader = DataLoader(
+        TransformDataset(train_loader.dataset), batch_size=16, shuffle=True
+    )
+    val_loader = DataLoader(
+        TransformDataset(val_loader.dataset), batch_size=16, shuffle=False
+    )
+    test_loader = DataLoader(
+        TransformDataset(test_loader.dataset), batch_size=16, shuffle=False
+    )
+
+    print("Setup Model.")
+    # vit_model = VitCnnLocal.ViT(
+    #     image_size=(64, 64),
+    #     patch_size=(8, 8),
+    #     num_classes=len(emotion_map),
+    #     dim=256,
+    #     depth=6,
+    #     heads=8,
+    #     cnn_channels=64,
+    #     mlp_dim=1024,
+    #     channels=4,
+    #     dropout=0.1,
+    #     emb_dropout=0.1,
+    # ).to(device)
+    vit_model = VitGlobal.ViT(
+        image_size=(64, 64),
+        patch_size=(8, 8),
+        num_classes=len(emotion_map),
+        dim=256,
+        depth=6,
+        heads=8,
+        # cnn_channels=64,
+        mlp_dim=1024,
+        channels=4,
+        dropout=0.1,
+        emb_dropout=0.1,
+    ).to(device)
+
+    print("Training Model.")
+    Model = train_model(
+        parameter=vit_model,
+        num_epochs=num_epochs,
+        device=device,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        save_dir=save_dir,
+    )
+
+    best_path = os.path.join(save_dir, "model_best.pth")
+    renamed_path = os.path.join(save_dir, f"model_best_{folder_name}.pth")
+    if os.path.exists(best_path):
+        os.rename(best_path, renamed_path)
+        print(f"Renamed {best_path} -> {renamed_path}")
+
+    print("Testing Model.")
+    test_model(
+        model=Model,
+        test_loader=test_loader,
+        device=device,
+        emotion_map=emotion_map,
+        save_dir=save_dir,
+    )
+
+    print(f"Done with {folder_name}.")

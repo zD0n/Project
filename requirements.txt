@@ -9,6 +9,7 @@ transformers
 lmdb
 pandas
 matplotlib
+numpy<=2.0.0
 einops
 librosa
 kymatio

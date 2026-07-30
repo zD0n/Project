@@ -53,7 +53,7 @@ def preprocess(mapping, path):
     print("Notice : This Process May take awhile. Try go Grab some Coffee..")
     for idx, row in labels_df.iterrows():
         filename = row["Filename"] + ".wav"
-        # print("Current File Working : ",filename)
+        print("Current File Working : ",filename)
         file_path = os.path.join(data_dir, filename)
 
         if not os.path.exists(file_path):
@@ -91,8 +91,8 @@ def preprocess(mapping, path):
         # Convert to ViT input
         # ---------------------------
         feat_tensor = features.unsqueeze(1)  # [1, 1, n_features, time_frames]
-        feat_resized = F.interpolate(feat_tensor, size=(64, 128), mode="bilinear")
-        feat_resized = feat_resized.repeat(1, 1, 1, 1)  # [1, 3, 256, 256]
+        feat_resized = F.interpolate(feat_tensor, size=(64), mode="bilinear")
+        feat_resized = feat_resized.repeat(1, 1, 1, 1)  # [1, 3, 64, 128]
         feat_resized = feat_resized.squeeze(0).cpu()
         X_list.append(feat_resized)
         y_list.append(emotion_map[emotion])
@@ -101,7 +101,7 @@ def preprocess(mapping, path):
     # ===========================
     # Final dataset tensors
     # ===========================
-    X = torch.stack(X_list)  # [num_samples, 3, 256, 256]
+    X = torch.stack(X_list)  # [num_samples, 3, 64, 128]
     y = torch.tensor(y_list)  # [num_samples]
 
     print("Final dataset shapes:")

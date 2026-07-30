@@ -3,3 +3,7 @@ results/
 weight/
 .venv/
 .ruff_cache/
+pipeline_output/
+dataset_preprocessed/
+__pycache__/
+Dataset2/
