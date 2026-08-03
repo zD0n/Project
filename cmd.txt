@@ -1,3 +1,4 @@
 docker build -t model .
 
-docker run --rm --gpus all -v "%cd%\Dataset2:/app/Dataset2" -v "%cd%\results:/app/results" -e NUM_EPOCHS=2 model
+docker run --rm --gpus all -v "%cd%\Dataset\CREMA-D:/app/Dataset2" -v "%cd%\results:/app/results" -e NUM_EPOCHS=2 model
+docker run --rm --gpus all -v "%cd%\Dataset\IEMOCAP:/app/Dataset2" -v "%cd%\results:/app/results" -e NUM_EPOCHS=2 model

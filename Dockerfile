@@ -27,17 +27,13 @@ RUN pip install --no-cache-dir \
     torchaudio==2.1.2+cu121 \
     --index-url https://download.pytorch.org/whl/cu121
 
-RUN pip install --no-cache-dir \
-    tensorflow-cpu==2.15.1 \
-    tensorflow-addons==0.23.0 \
-    gin-config \
-    "numpy<2.0"
+RUN pip install --no-cache-dir "numpy<2.0"
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY leaf-audio/leaf_audio ./leaf_audio
+COPY FrontEnd/leaf_pytorch ./leaf_pytorch
 COPY Model ./Model
-COPY Run4.py .
+COPY Run5.py .
 
-CMD ["python", "Run4.py"]
+CMD ["python", "Run5.py"]
