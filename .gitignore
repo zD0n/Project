@@ -1,0 +1,12 @@
+Dataset/
+results/
+results2/
+weight/
+.venv/
+.ruff_cache/
+pipeline_output/
+dataset_preprocessed/
+__pycache__/
+Dataset2/
+leaf-audio/
+leaf_output/

@@ -1,0 +1,20 @@
+# datasets & outputs
+Dataset/
+Dataset2/
+results/
+weight/
+SystemChecking/
+show/
+leaf_output/
+leaf-audio/
+!leaf-audio/leaf_audio/
+# python junk
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# git
+.git
+.gitignore
+.md
