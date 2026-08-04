@@ -29,11 +29,17 @@ RUN pip install --no-cache-dir \
 
 RUN pip install --no-cache-dir "numpy<2.0"
 
+RUN pip install --no-cache-dir \
+    "tensorflow[and-cuda]==2.15.1" \
+    gin-config
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY FrontEnd/leaf_pytorch ./leaf_pytorch
+COPY leaf-audio/leaf_audio ./leaf_audio
 COPY Model ./Model
 COPY Run5.py .
+COPY Run6.py .
+# Run5 = leaf_pytorch + VitGlobal; Run6 = TF leaf-audio + VitCnnGlobal.
 
 CMD ["python", "Run5.py"]

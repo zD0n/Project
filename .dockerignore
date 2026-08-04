@@ -6,8 +6,9 @@ weight/
 SystemChecking/
 show/
 leaf_output/
-leaf-audio/
-!leaf-audio/leaf_audio/
+leaf-audio/example/
+leaf-audio/setup.py
+leaf-audio/.git/
 # python junk
 __pycache__/
 *.pyc

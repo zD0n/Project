@@ -1,4 +1,13 @@
 docker build -t model .
 
-docker run --rm --gpus all -v "%cd%\Dataset\CREMA-D:/app/Dataset2" -v "%cd%\results:/app/results" -e NUM_EPOCHS=2 model
-docker run --rm --gpus all -v "%cd%\Dataset\IEMOCAP:/app/Dataset2" -v "%cd%\results:/app/results" -e NUM_EPOCHS=2 model
+docker run --rm --gpus all -v "${PWD}\Dataset\CREMA-D:/app/Dataset2" -v "${PWD}\results:/app/results" -e NUM_EPOCHS=2 model
+docker run --rm --gpus all -v "${PWD}\Dataset\IEMOCAP:/app/Dataset2" -v "${PWD}\results:/app/results" -e NUM_EPOCHS=2 model
+
+docker run --rm --gpus all -v "${PWD}\Dataset\CREMA-D:/app/Dataset2" -v "${PWD}\results:/app/results" -e NUM_EPOCHS=2 model python Run6.py
+docker run --rm --gpus all -v "${PWD}\Dataset\IEMOCAP:/app/Dataset2" -v "${PWD}\results:/app/results" -e NUM_EPOCHS=2 model python Run6.py
+
+REM Run6 ablation: baseline -> +CoordViT -> +SpecAugment -> both
+docker run --rm --gpus all -v "${PWD}\Dataset\IEMOCAP:/app/Dataset2" -v "${PWD}\results:/app/results" -e COORD_CHANNELS=0 -e SPEC_AUGMENT=0 model python Run6.py
+docker run --rm --gpus all -v "${PWD}\Dataset\IEMOCAP:/app/Dataset2" -v "${PWD}\results:/app/results" -e COORD_CHANNELS=1 -e SPEC_AUGMENT=0 model python Run6.py
+docker run --rm --gpus all -v "${PWD}\Dataset\IEMOCAP:/app/Dataset2" -v "${PWD}\results:/app/results" -e COORD_CHANNELS=0 -e SPEC_AUGMENT=1 model python Run6.py
+docker run --rm --gpus all -v "${PWD}\Dataset\IEMOCAP:/app/Dataset2" -v "${PWD}\results:/app/results" -e COORD_CHANNELS=1 -e SPEC_AUGMENT=1 model python Run6.py

@@ -202,6 +202,16 @@ for fname in audio_files:
 
 all_labels = np.array(all_labels, dtype=np.int64)
 lengths = np.array([a.shape[0] for a in all_audio])
+# One fixed input length for every batch. 0 = auto (75th percentile, capped at
+# 6s) -- long enough to cover most clips without making every batch pay for the
+# rare 17s outlier.
+FIXED_SECONDS = _env("FIXED_SECONDS", 0.0)
+if FIXED_SECONDS <= 0:
+    FIXED_SECONDS = min(6.0, max(2.0, float(np.percentile(lengths, 75)) / SAMPLE_RATE))
+FIXED_SAMPLES = int(round(FIXED_SECONDS * SAMPLE_RATE))
+_trunc = int((lengths > FIXED_SAMPLES).sum())
+print(f"Fixed input window: {FIXED_SECONDS:.2f}s ({FIXED_SAMPLES} samples) | "
+      f"{_trunc} of {len(lengths)} clips cropped ({_trunc / len(lengths) * 100:.1f}%)")
 print(
     f"Loaded {len(all_audio)} files | max length: {lengths.max()} samples | "
     f"total {lengths.sum() / SAMPLE_RATE:.1f}s"
@@ -245,14 +255,16 @@ if SPLIT_MODE == "speaker":
     print("  speaker overlap train/eval: {} (must be 0)".format(len(overlap)))
 
 
-def make_batch(indices):
-    batch_list = [all_audio[i] for i in indices]
-    bs = len(batch_list)
-    batch_len = max(x.shape[0] for x in batch_list)
-    batch = np.zeros((bs, batch_len), dtype=np.float32)
-    for j, x in enumerate(batch_list):
+def make_batch(indices, train=False):
+    batch = np.zeros((len(indices), FIXED_SAMPLES), dtype=np.float32)
+    for j, i in enumerate(indices):
+        x = all_audio[i]
         n = x.shape[0]
-        batch[j, :n] = x
+        if n > FIXED_SAMPLES:
+            off = np.random.randint(0, n - FIXED_SAMPLES + 1) if train else 0
+            batch[j] = x[off:off + FIXED_SAMPLES]
+        else:
+            batch[j, :n] = x
     return batch
 
 
@@ -380,7 +392,7 @@ for epoch in range(NUM_EPOCHS):
         batch_idx_arr = perm[start:end]
         bs = len(batch_idx_arr)
 
-        feat_t = leaf_features(make_batch(batch_idx_arr))
+        feat_t = leaf_features(make_batch(batch_idx_arr, train=True))
         target_t = torch.tensor(all_labels[batch_idx_arr], dtype=torch.long, device=device)
 
         optimizer.zero_grad(set_to_none=True)
@@ -393,6 +405,10 @@ for epoch in range(NUM_EPOCHS):
         epoch_correct += (output.argmax(1) == target_t).sum().item()
 
     scheduler.step()
+    # Belt and braces: with a constant shape the allocator should be stable, but
+    # releasing cached blocks each epoch keeps memory flat over a 60-epoch run.
+    if device == "cuda":
+        torch.cuda.empty_cache()
     avg_loss = epoch_loss / n_train
     acc = epoch_correct / n_train * 100
     val_wa, val_uar, _, _ = evaluate(val_idx)
