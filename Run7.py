@@ -42,7 +42,7 @@ LABEL_ALIASES = {
 }
 
 DATASET_DIR = "Dataset2"
-RESULT_DIR = "./results/LeafTF_VitCnnGlobal_Coord"
+RESULT_DIR = "./results/LeafTF_ViT"
 SAMPLE_RATE = 16000
 
 
