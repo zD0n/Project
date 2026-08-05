@@ -64,7 +64,7 @@ TARGET_SIZE = _env("TARGET_SIZE", 64, int)
 WINDOW_LEN = _env("WINDOW_LEN", 25, float)
 LEAF_LR = _env("LEAF_LR", 1e-5)          # frontend learns far slower than the head
 
-NUM_EPOCHS = _env("NUM_EPOCHS", 60, int)
+NUM_EPOCHS = _env("NUM_EPOCHS", 30, int)
 BATCH_SIZE = _env("BATCH_SIZE", 32, int)
 LR = _env("LR", 3e-4)
 WEIGHT_DECAY = _env("WEIGHT_DECAY", 0.05)

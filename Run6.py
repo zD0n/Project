@@ -14,8 +14,7 @@ from torch import nn, optim
 
 import tensorflow as tf
 
-# Memory growth MUST be set before TF touches the GPU, otherwise TF pre-allocates
-# nearly all VRAM and PyTorch is left with nothing.
+
 _gpus = tf.config.list_physical_devices("GPU")
 for _g in _gpus:
     try:
@@ -28,7 +27,7 @@ import functools
 
 import leaf_audio.frontend as leaf_frontend_mod
 from leaf_audio import initializers
-from Model import VitCnnGlobal
+from Model import VitCnnGlobal, VitCnnLocal, VitGlobal, VitLocal
 
 # ---------------------------------------------------------------------------
 # Config
@@ -59,7 +58,7 @@ LEAF_LR = _env("LEAF_LR", 1e-5)
 LEAF_PREEMP = _env("LEAF_PREEMP", 1, int)        # TF LEAF supports pre-emphasis
 LEARN_POOLING = _env("LEARN_POOLING", 0, int)
 
-NUM_EPOCHS = _env("NUM_EPOCHS", 60, int)
+NUM_EPOCHS = _env("NUM_EPOCHS", 30, int)
 BATCH_SIZE = _env("BATCH_SIZE", 32, int)
 LR = _env("LR", 3e-4)
 WEIGHT_DECAY = _env("WEIGHT_DECAY", 0.05)
@@ -75,6 +74,14 @@ DIM_HEAD = _env("DIM_HEAD", 64, int)
 CNN_CHANNELS = _env("CNN_CHANNELS", 64, int)     # CNN stem width (the "improved" part)
 DROPOUT = _env("DROPOUT", 0.2)
 EMB_DROPOUT = _env("EMB_DROPOUT", 0.1)
+RESUME = _env("RESUME", 0, int)
+
+# Which classifier to put on top of the LEAF features:
+#   vit            Model/VitGlobal      plain ViT, global attention, no CNN stem
+#   vit_local      Model/VitLocal       plain ViT, windowed local attention
+#   cnn_vit        Model/VitCnnGlobal   CNN stem + global attention  (default)
+#   cnn_vit_local  Model/VitCnnLocal    CNN stem + local attention
+MODEL = os.environ.get("MODEL", "cnn_vit").lower()
 
 SPLIT_MODE = os.environ.get("SPLIT_MODE", "speaker")
 TEST_FRAC = _env("TEST_FRAC", 0.2)
@@ -278,10 +285,23 @@ leaf = leaf_frontend_mod.Leaf(
 # Build the Keras layer so trainable_variables exists before the optimizer.
 leaf(tf.zeros((1, SAMPLE_RATE), dtype=tf.float32), training=False)
 
+def _leaf_is_finite():
+    return all(bool(np.isfinite(v.numpy()).all()) for v in leaf.trainable_variables)
+
+
 leaf_weights_path = os.path.join(RESULT_DIR, "leaf_weights.h5")
-if os.path.exists(leaf_weights_path):
+# RESUME defaults to 0: each run starts from a fresh mel initialization, so one
+# diverged run cannot poison later ones and ablation runs stay independent.
+if RESUME and os.path.exists(leaf_weights_path):
     leaf.load_weights(leaf_weights_path)
-    print(f"Loaded LEAF weights from {leaf_weights_path}")
+    if _leaf_is_finite():
+        print(f"Loaded LEAF weights from {leaf_weights_path}")
+    else:
+        raise SystemExit(f"{leaf_weights_path} contains non-finite values; "
+                         f"delete it or run without RESUME=1.")
+elif os.path.exists(leaf_weights_path):
+    print(f"Ignoring existing {os.path.basename(leaf_weights_path)} "
+          f"(set RESUME=1 to continue from it).")
 
 _use_dlpack = bool(_gpus) and device == "cuda"
 
@@ -333,20 +353,24 @@ def leaf_forward(waveforms, training):
 # ---------------------------------------------------------------------------
 # Model: CNN-stem ViT
 # ---------------------------------------------------------------------------
-vit_model = VitCnnGlobal.ViT(
-    image_size=(TARGET_SIZE, TARGET_SIZE),
-    patch_size=(PATCH, PATCH),
-    num_classes=NUM_CLASSES,
-    dim=DIM,
-    depth=DEPTH,
-    heads=HEADS,
-    mlp_dim=MLP_DIM,
-    channels=1,
-    dim_head=DIM_HEAD,
-    dropout=DROPOUT,
-    emb_dropout=EMB_DROPOUT,
-    cnn_channels=CNN_CHANNELS,
-).to(device)
+_MODELS = {"vit": VitGlobal, "vit_local": VitLocal,
+           "cnn_vit": VitCnnGlobal, "cnn_vit_local": VitCnnLocal}
+if MODEL not in _MODELS:
+    raise SystemExit(f"MODEL={MODEL!r} unknown; choose one of {sorted(_MODELS)}")
+
+# The four variants take different kwargs: only the cnn_* ones accept
+# cnn_channels, and VitCnnLocal does not accept dim_head.
+_kw = dict(image_size=(TARGET_SIZE, TARGET_SIZE), patch_size=(PATCH, PATCH),
+           num_classes=NUM_CLASSES, dim=DIM, depth=DEPTH, heads=HEADS,
+           mlp_dim=MLP_DIM, channels=1,
+           dropout=DROPOUT, emb_dropout=EMB_DROPOUT)
+if MODEL.startswith("cnn_"):
+    _kw["cnn_channels"] = CNN_CHANNELS
+if MODEL != "cnn_vit_local":
+    _kw["dim_head"] = DIM_HEAD
+
+vit_model = _MODELS[MODEL].ViT(**_kw).to(device)
+print(f"Model: {MODEL} ({_MODELS[MODEL].__name__})")
 
 print(f"Trainable params -- LEAF(tf): {sum(int(np.prod(v.shape)) for v in leaf.trainable_variables)}, "
       f"ViT+CNN: {sum(p.numel() for p in vit_model.parameters())}")
@@ -456,10 +480,13 @@ for epoch in range(NUM_EPOCHS):
                       "time_s": round(elapsed, 1)})
 
     star = ""
-    if val_uar > best_uar:
+    if not np.isfinite(avg_loss):
+        star = "  !! non-finite loss -- not checkpointing"
+    elif val_uar > best_uar:
         best_uar = val_uar
         torch.save({"vit": vit_model.state_dict()}, best_path)
-        leaf.save_weights(leaf_weights_path)
+        if _leaf_is_finite():
+            leaf.save_weights(leaf_weights_path)
         star = "  <- best"
     print(f"Epoch [{epoch + 1}/{NUM_EPOCHS}]  loss={avg_loss:.4f}  train={acc:.1f}%  "
           f"val_WA={val_wa * 100:.1f}%  val_UAR={val_uar * 100:.1f}%  "

@@ -40,6 +40,7 @@ COPY leaf-audio/leaf_audio ./leaf_audio
 COPY Model ./Model
 COPY Run5.py .
 COPY Run6.py .
+COPY Run7.py .
 # Run5 = leaf_pytorch + VitGlobal; Run6 = TF leaf-audio + VitCnnGlobal.
 
 CMD ["python", "Run5.py"]

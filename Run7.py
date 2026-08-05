@@ -14,8 +14,6 @@ from torch import nn, optim
 
 import tensorflow as tf
 
-# Memory growth MUST be set before TF touches the GPU, otherwise TF pre-allocates
-# nearly all VRAM and PyTorch is left with nothing.
 _gpus = tf.config.list_physical_devices("GPU")
 for _g in _gpus:
     try:
@@ -28,7 +26,7 @@ import functools
 
 import leaf_audio.frontend as leaf_frontend_mod
 from leaf_audio import initializers
-from Model import VitCnnGlobal
+from Model import VitCnnGlobal, VitCnnLocal, VitGlobal, VitLocal
 
 # ---------------------------------------------------------------------------
 # Config
@@ -59,7 +57,7 @@ LEAF_LR = _env("LEAF_LR", 1e-5)
 LEAF_PREEMP = _env("LEAF_PREEMP", 1, int)        # TF LEAF supports pre-emphasis
 LEARN_POOLING = _env("LEARN_POOLING", 0, int)
 
-NUM_EPOCHS = _env("NUM_EPOCHS", 60, int)
+NUM_EPOCHS = _env("NUM_EPOCHS", 30, int)
 BATCH_SIZE = _env("BATCH_SIZE", 32, int)
 LR = _env("LR", 3e-4)
 WEIGHT_DECAY = _env("WEIGHT_DECAY", 0.05)
@@ -76,21 +74,29 @@ CNN_CHANNELS = _env("CNN_CHANNELS", 64, int)     # CNN stem width (the "improved
 DROPOUT = _env("DROPOUT", 0.2)
 EMB_DROPOUT = _env("EMB_DROPOUT", 0.1)
 
-# --- methods taken from the papers in Reasearch/ ---------------------------
-# CoordViT (Reasearch/CoordViT...pdf): a ViT's linear projection discards pixel
-# position information. Concatenating coordinate planes to the input restores
-# it. That paper reports 82.96% on CREMA-D, the best CREMA-D figure in the
-# corpus, from this change alone.
+
 COORD_CHANNELS = _env("COORD_CHANNELS", 1, int)
-# SCQT-MaxViT (Reasearch/SCQT-MaxViT...pdf) augments with "random time masking"
-# to improve generalization; Speech Swin-Transformer masks similarly. Applied to
-# the feature image, not the waveform.
+
 SPEC_AUGMENT = _env("SPEC_AUGMENT", 1, int)
-FREQ_MASK = _env("FREQ_MASK", 8, int)      # max consecutive frequency bins masked
-TIME_MASK = _env("TIME_MASK", 16, int)     # max consecutive time frames masked
-# Per-sample instance norm of the feature image. Not from a paper -- standard
-# practice, and LEAF's PCEN/log output has a strong per-utterance offset.
+FREQ_MASK = _env("FREQ_MASK", 8, int)     
+TIME_MASK = _env("TIME_MASK", 16, int)     
+
 NORMALIZE = _env("NORMALIZE", 1, int)
+
+DROP_PATH = _env("DROP_PATH", 0.1)
+
+MIXUP_ALPHA = _env("MIXUP_ALPHA", 0.2)
+
+POOL = os.environ.get("POOL", "cls")
+
+# Which classifier to put on top of the LEAF features:
+#   vit            Model/VitGlobal      plain ViT, global attention, no CNN stem
+#   vit_local      Model/VitLocal       plain ViT, windowed local attention
+#   cnn_vit        Model/VitCnnGlobal   CNN stem + global attention  (default)
+#   cnn_vit_local  Model/VitCnnLocal    CNN stem + local attention
+MODEL = os.environ.get("MODEL", "cnn_vit").lower()
+
+RESUME = _env("RESUME", 0, int)
 
 SPLIT_MODE = os.environ.get("SPLIT_MODE", "speaker")
 TEST_FRAC = _env("TEST_FRAC", 0.2)
@@ -196,8 +202,7 @@ lengths = np.array([a.shape[0] for a in all_audio])
 print(f"Loaded {len(all_audio)} files | max length: {lengths.max()} samples | "
       f"total {lengths.sum() / SAMPLE_RATE:.1f}s")
 
-# One fixed input length for every batch. 0 = auto (75th percentile, capped at
-# 6s). Constant shapes also stop TensorFlow retracing the frontend each batch.
+
 FIXED_SECONDS = _env("FIXED_SECONDS", 0.0)
 if FIXED_SECONDS <= 0:
     FIXED_SECONDS = min(6.0, max(2.0, float(np.percentile(lengths, 75)) / SAMPLE_RATE))
@@ -206,11 +211,7 @@ _trunc = int((lengths > FIXED_SAMPLES).sum())
 print(f"Fixed input window: {FIXED_SECONDS:.2f}s ({FIXED_SAMPLES} samples) | "
       f"{_trunc} of {len(lengths)} clips cropped ({_trunc / len(lengths) * 100:.1f}%)")
 
-# TF LEAF runs its complex conv + squared modulus at FULL waveform resolution
-# before pooling to frames, so the peak intermediate is
-#   batch x (2 * n_filters) x samples x 4 bytes
-# and the backward pass holds several copies of it. This is the tensor that
-# OOMs -- it scales with the input window, not with the 64x64 output.
+
 _peak_gb = BATCH_SIZE * 2 * LEAF_N_FILTERS * FIXED_SAMPLES * 4 / 1e9
 print(f"LEAF peak intermediate: ~{_peak_gb:.2f} GB/copy "
       f"({BATCH_SIZE} x {2 * LEAF_N_FILTERS} x {FIXED_SAMPLES})")
@@ -253,17 +254,7 @@ if SPLIT_MODE == "speaker":
 
 
 def make_batch(indices, train=False):
-    """(B, FIXED_SAMPLES) -- one constant shape for the whole run.
 
-    Batch-max padding made epochs progressively slower: IEMOCAP clips run
-    0.78s-17.3s so nearly every batch was a new shape. That hurts twice here --
-    the CUDA allocator keeps a block per shape, and TensorFlow RETRACES the
-    Keras frontend for every unseen input shape, growing its function cache all
-    run. A single fixed length removes both.
-
-    Long clips are cropped at a random offset while training (cheap
-    augmentation) and from the start at eval; short clips are zero-padded.
-    """
     batch = np.zeros((len(indices), FIXED_SAMPLES), dtype=np.float32)
     for j, i in enumerate(indices):
         x = all_audio[i]
@@ -295,16 +286,34 @@ leaf = leaf_frontend_mod.Leaf(
 # Build the Keras layer so trainable_variables exists before the optimizer.
 leaf(tf.zeros((1, SAMPLE_RATE), dtype=tf.float32), training=False)
 
+def _leaf_is_finite():
+    return all(bool(np.isfinite(v.numpy()).all()) for v in leaf.trainable_variables)
+
+
 leaf_weights_path = os.path.join(RESULT_DIR, "leaf_weights.h5")
-if os.path.exists(leaf_weights_path):
+
+if RESUME and os.path.exists(leaf_weights_path):
     leaf.load_weights(leaf_weights_path)
-    print(f"Loaded LEAF weights from {leaf_weights_path}")
+    if _leaf_is_finite():
+        print(f"Loaded LEAF weights from {leaf_weights_path}")
+    else:
+        print(f"REFUSED to resume: {leaf_weights_path} contains non-finite "
+              f"values. Re-initializing the frontend.")
+        leaf = leaf_frontend_mod.Leaf(
+            learn_pooling=bool(LEARN_POOLING), n_filters=LEAF_N_FILTERS,
+            window_len=WINDOW_LEN, sample_rate=SAMPLE_RATE,
+            preemp=bool(LEAF_PREEMP), compression_fn=compression_fn,
+            complex_conv_init=complex_conv_init)
+        leaf(tf.zeros((1, SAMPLE_RATE), dtype=tf.float32), training=False)
+elif os.path.exists(leaf_weights_path):
+    print(f"Ignoring existing {os.path.basename(leaf_weights_path)} "
+          f"(set RESUME=1 to continue from it).")
 
 _use_dlpack = bool(_gpus) and device == "cuda"
 
 
 def tf_to_torch(t):
-    """TF tensor -> torch tensor, staying on GPU when DLPack is available."""
+
     if _use_dlpack:
         try:
             from torch.utils import dlpack as tdl
@@ -315,7 +324,7 @@ def tf_to_torch(t):
 
 
 def torch_to_tf(t):
-    """torch tensor -> TF tensor, staying on GPU when DLPack is available."""
+
     t = t.contiguous()
     if _use_dlpack:
         try:
@@ -327,11 +336,7 @@ def torch_to_tf(t):
 
 
 def leaf_forward(waveforms, training):
-    """(B,T) numpy -> TF tape (or None) and TF features resized to the ViT input.
 
-    TF LEAF emits (B, frames, n_filters); resizing to (TARGET, TARGET) keeps the
-    original time-on-rows orientation used by the earlier runs.
-    """
     batch_tf = tf.constant(waveforms)
     if training:
         tape = tf.GradientTape()
@@ -350,23 +355,71 @@ def leaf_forward(waveforms, training):
 # ---------------------------------------------------------------------------
 # Model: CNN-stem ViT
 # ---------------------------------------------------------------------------
-vit_model = VitCnnGlobal.ViT(
-    image_size=(TARGET_SIZE, TARGET_SIZE),
-    patch_size=(PATCH, PATCH),
-    num_classes=NUM_CLASSES,
-    dim=DIM,
-    depth=DEPTH,
-    heads=HEADS,
-    mlp_dim=MLP_DIM,
-    channels=VIT_CHANNELS,   # 1 LEAF plane + 2 CoordViT position planes
-    dim_head=DIM_HEAD,
-    dropout=DROPOUT,
-    emb_dropout=EMB_DROPOUT,
-    cnn_channels=CNN_CHANNELS,
-).to(device)
+_MODELS = {"vit": VitGlobal, "vit_local": VitLocal,
+           "cnn_vit": VitCnnGlobal, "cnn_vit_local": VitCnnLocal}
+if MODEL not in _MODELS:
+    raise SystemExit(f"MODEL={MODEL!r} unknown; choose one of {sorted(_MODELS)}")
+
+# The four variants take different kwargs: only the cnn_* ones accept
+# cnn_channels, and VitCnnLocal does not accept dim_head.
+_kw = dict(image_size=(TARGET_SIZE, TARGET_SIZE), patch_size=(PATCH, PATCH),
+           num_classes=NUM_CLASSES, dim=DIM, depth=DEPTH, heads=HEADS,
+           mlp_dim=MLP_DIM,
+           channels=VIT_CHANNELS,   # 1 LEAF plane + 2 CoordViT position planes
+           pool=POOL, dropout=DROPOUT, emb_dropout=EMB_DROPOUT)
+if MODEL.startswith("cnn_"):
+    _kw["cnn_channels"] = CNN_CHANNELS
+if MODEL != "cnn_vit_local":
+    _kw["dim_head"] = DIM_HEAD
+
+vit_model = _MODELS[MODEL].ViT(**_kw).to(device)
+print(f"Model: {MODEL} ({_MODELS[MODEL].__name__})")
+
+class DropPath(nn.Module):
+    """Stochastic depth on one residual branch.
+
+    VitCnnGlobal's Transformer does `x = attn(x) + x`, so wrapping `attn` gives
+    exactly `x + drop_path(attn(x))` -- the standard formulation, with no edit to
+    Model/VitCnnGlobal.py (which Run6 also uses).
+    """
+
+    def __init__(self, module, p):
+        super().__init__()
+        self.module = module
+
+        self.p = min(max(float(p), 0.0), 0.9)
+
+    def forward(self, x):
+        out = self.module(x)
+        if not self.training or self.p <= 0.0:
+            return out
+        keep = 1.0 - self.p
+        mask = torch.empty((x.shape[0], 1, 1), device=out.device,
+                           dtype=out.dtype).bernoulli_(keep)
+        return out * mask / keep
+
+
+if DROP_PATH >= 1.0:
+    print(f"WARNING: DROP_PATH={DROP_PATH:g} means the deepest block is dropped "
+          f"100% of the time. Clamping to 0.9. Use DROP_PATH=0 to disable "
+          f"stochastic depth; sane values are 0.05-0.3.")
+    DROP_PATH = 0.9
+
+if DROP_PATH > 0:
+    _blocks = vit_model.transformer.layers
+    _n = len(_blocks)
+    for _i, _blk in enumerate(_blocks):
+
+        _p = DROP_PATH * _i / max(1, _n - 1)
+        _blk[0] = DropPath(_blk[0], _p)
+        _blk[1] = DropPath(_blk[1], _p)
+    vit_model = vit_model.to(device)
+    print(f"Stochastic depth: 0 -> {DROP_PATH:g} across {_n} blocks")
 
 print(f"Trainable params -- LEAF(tf): {sum(int(np.prod(v.shape)) for v in leaf.trainable_variables)}, "
       f"ViT+CNN: {sum(p.numel() for p in vit_model.parameters())}")
+print(f"Methods: coord={COORD_CHANNELS} specaug={SPEC_AUGMENT} norm={NORMALIZE} "
+      f"drop_path={DROP_PATH:g} mixup={MIXUP_ALPHA:g} pool={POOL}")
 
 optimizer = optim.AdamW(vit_model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 leaf_optimizer = tf.keras.optimizers.Adam(learning_rate=LEAF_LR)
@@ -387,12 +440,7 @@ _coord_cache = {}
 
 
 def coord_planes(b, h, w):
-    """CoordViT: two extra input planes holding normalized (time, freq) position.
 
-    The patch embedding is a linear projection over flattened patches, so it
-    cannot tell one patch's location from another's. Feeding coordinates as
-    extra channels puts that information back where attention can use it.
-    """
     key = (h, w)
     if key not in _coord_cache:
         ys = torch.linspace(-1, 1, h, device=device).view(1, 1, h, 1).expand(1, 1, h, w)
@@ -402,12 +450,7 @@ def coord_planes(b, h, w):
 
 
 def spec_augment(x):
-    """SCQT-MaxViT-style random time/frequency masking.
 
-    Multiplicative rather than in-place assignment: x is downstream of the
-    TF/torch seam tensor, so writing into it would break the manual chain rule.
-    Rows are time, columns are frequency (leaf_forward keeps that orientation).
-    """
     b, _, h, w = x.shape
     mask = torch.ones((b, 1, h, w), device=x.device, dtype=x.dtype)
     for i in range(b):
@@ -484,29 +527,64 @@ for epoch in range(NUM_EPOCHS):
         idx = perm[b * BATCH_SIZE:min((b + 1) * BATCH_SIZE, n_train)]
         bs = len(idx)
 
-        # 1. frontend forward, recorded on the TF tape
+
         tape, feats_tf = leaf_forward(make_batch(idx, train=True), training=True)
 
-        # 2. hand the features to PyTorch; this tensor is the seam between the
-        #    two autograd systems, so it must be a leaf that requires grad.
+
         feat_t = tf_to_torch(feats_tf).float().unsqueeze(1).to(device)
         feat_t.requires_grad_(True)
         target_t = torch.tensor(all_labels[idx], dtype=torch.long, device=device)
 
-        # 3. ViT forward/backward. prepare_features (norm + SpecAugment + coord
-        #    planes) sits AFTER the seam, so its ops are part of the torch graph
-        #    and feat_t.grad still carries dL/dfeatures back to the TF tape.
+
         optimizer.zero_grad(set_to_none=True)
-        output = vit_model(prepare_features(feat_t, True))
-        loss = criterion(output, target_t)
+        x_in = prepare_features(feat_t, True)
+
+        if MIXUP_ALPHA > 0 and x_in.shape[0] > 1:
+            lam = float(np.random.beta(MIXUP_ALPHA, MIXUP_ALPHA))
+            mix = torch.randperm(x_in.shape[0], device=device)
+
+            x_in = lam * x_in + (1.0 - lam) * x_in[mix]
+            output = vit_model(x_in)
+            loss = lam * criterion(output, target_t) + \
+                (1.0 - lam) * criterion(output, target_t[mix])
+        else:
+            output = vit_model(x_in)
+            loss = criterion(output, target_t)
+
+        if epoch == 0 and b == 0:
+            def _stat(name, t):
+                t = t.detach()
+                ok = bool(torch.isfinite(t).all())
+                print("  [check] {:<22s} finite={:<5} min={:+.4g} max={:+.4g} "
+                      "mean={:+.4g}".format(
+                          name, str(ok), float(t.min()), float(t.max()),
+                          float(t.float().mean())))
+                return ok
+            print("first-batch sanity check:")
+            _leaf_np = feats_tf.numpy()
+            print("  [check] {:<22s} finite={:<5} min={:+.4g} max={:+.4g}".format(
+                "leaf output (TF)", str(bool(np.isfinite(_leaf_np).all())),
+                float(np.nanmin(_leaf_np)), float(np.nanmax(_leaf_np))))
+            _stat("after tf_to_torch", feat_t)
+            _stat("after prepare/mixup", x_in)
+            _stat("vit output", output)
+            _stat("loss", loss)
+
         loss.backward()
         optimizer.step()
 
-        # 4. push dL/dfeatures back across the seam so the tape can finish the
-        #    chain rule into the Gabor filters.
+
+        if epoch == 0 and b == 0 and feat_t.grad is not None:
+            print("  [check] {:<22s} finite={}".format(
+                "dL/dfeatures", bool(torch.isfinite(feat_t.grad).all())))
         grad_tf = torch_to_tf(feat_t.grad.squeeze(1))
         leaf_grads = tape.gradient(feats_tf, leaf.trainable_variables,
                                    output_gradients=grad_tf)
+        if epoch == 0 and b == 0:
+            for _g, _v in zip(leaf_grads, leaf.trainable_variables):
+                if _g is not None:
+                    print("  [check] leaf grad {:<12s} finite={}".format(
+                        _v.name[:12], bool(np.isfinite(_g.numpy()).all())))
         pairs = [(g, v) for g, v in zip(leaf_grads, leaf.trainable_variables)
                  if g is not None]
         if pairs:
@@ -517,8 +595,7 @@ for epoch in range(NUM_EPOCHS):
         epoch_correct += (output.argmax(1) == target_t).sum().item()
 
     scheduler.step()
-    # TF and torch each hold their own GPU cache; release torch's every epoch so
-    # the two allocators do not slowly squeeze each other over a long run.
+
     if device == "cuda":
         torch.cuda.empty_cache()
     avg_loss = epoch_loss / n_train
@@ -532,10 +609,14 @@ for epoch in range(NUM_EPOCHS):
                       "time_s": round(elapsed, 1)})
 
     star = ""
-    if val_uar > best_uar:
+
+    if not np.isfinite(avg_loss):
+        star = "  !! non-finite loss -- not checkpointing"
+    elif val_uar > best_uar:
         best_uar = val_uar
         torch.save({"vit": vit_model.state_dict()}, best_path)
-        leaf.save_weights(leaf_weights_path)
+        if _leaf_is_finite():
+            leaf.save_weights(leaf_weights_path)
         star = "  <- best"
     print(f"Epoch [{epoch + 1}/{NUM_EPOCHS}]  loss={avg_loss:.4f}  train={acc:.1f}%  "
           f"val_WA={val_wa * 100:.1f}%  val_UAR={val_uar * 100:.1f}%  "
@@ -576,7 +657,7 @@ print(cm_df.to_string())
 cm_df.to_csv(os.path.join(RESULT_DIR, "confusion_matrix.csv"))
 pd.DataFrame(train_log).to_csv(os.path.join(RESULT_DIR, "training_log.csv"), index=False)
 
-run = {"frontend": "leaf-audio-tf", "model": "VitCnnGlobal", "dataset": DATASET,
+run = {"frontend": "leaf-audio-tf", "model": MODEL, "dataset": DATASET,
        "classes": NUM_CLASSES, "split_mode": SPLIT_MODE, "epochs": NUM_EPOCHS,
        "batch": BATCH_SIZE, "lr": LR, "leaf_lr": LEAF_LR,
        "weight_decay": WEIGHT_DECAY, "label_smoothing": LABEL_SMOOTHING,
@@ -585,6 +666,7 @@ run = {"frontend": "leaf-audio-tf", "model": "VitCnnGlobal", "dataset": DATASET,
        "cnn_channels": CNN_CHANNELS, "target_size": TARGET_SIZE,
        "coord_channels": COORD_CHANNELS, "spec_augment": SPEC_AUGMENT,
        "freq_mask": FREQ_MASK, "time_mask": TIME_MASK, "normalize": NORMALIZE,
+       "drop_path": DROP_PATH, "mixup_alpha": MIXUP_ALPHA, "pool": POOL,
        "fixed_seconds": FIXED_SECONDS,
        "leaf_filters": LEAF_N_FILTERS, "preemp": LEAF_PREEMP,
        "learn_pooling": LEARN_POOLING, "seed": SEED,
