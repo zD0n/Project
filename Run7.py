@@ -215,10 +215,21 @@ print(f"Fixed input window: {FIXED_SECONDS:.2f}s ({FIXED_SAMPLES} samples) | "
 _peak_gb = BATCH_SIZE * 2 * LEAF_N_FILTERS * FIXED_SAMPLES * 4 / 1e9
 print(f"LEAF peak intermediate: ~{_peak_gb:.2f} GB/copy "
       f"({BATCH_SIZE} x {2 * LEAF_N_FILTERS} x {FIXED_SAMPLES})")
-if _peak_gb > 0.5:
-    print(f"  WARNING: backward needs several copies of this -- OOM is likely.")
-    print(f"  Lower BATCH_SIZE and/or FIXED_SECONDS, e.g. "
-          f"-e BATCH_SIZE={max(4, BATCH_SIZE // 4)} -e FIXED_SECONDS=3")
+if _peak_gb > 0.5 and not _env("ALLOW_BIG_BATCH", 0, int):
+    _fit = max(2, int(0.25e9 // (2 * LEAF_N_FILTERS * FIXED_SAMPLES * 4)))
+    raise SystemExit(
+        "\nRefusing to start: the LEAF intermediate is ~{:.2f} GB per copy and the\n"
+        "backward pass holds several of them. This OOMs on a 12 GB GPU.\n"
+        "\n"
+        "  Why: TF LEAF runs its complex conv + squared modulus at FULL waveform\n"
+        "  resolution before pooling, so memory scales with\n"
+        "      BATCH_SIZE x (2 * LEAF_N_FILTERS) x samples x 4 bytes\n"
+        "  = {} x {} x {} x 4 = {:.2f} GB\n"
+        "\n"
+        "  Fix: add   -e BATCH_SIZE={} -e FIXED_SECONDS=3\n"
+        "  Override:  -e ALLOW_BIG_BATCH=1   (only on a larger GPU)\n"
+        .format(_peak_gb, BATCH_SIZE, 2 * LEAF_N_FILTERS, FIXED_SAMPLES,
+                _peak_gb, min(_fit, 8)))
 
 # ---------------------------------------------------------------------------
 # Split
