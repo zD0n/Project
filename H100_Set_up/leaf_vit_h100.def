@@ -1,0 +1,112 @@
+Bootstrap: docker
+From: pytorch/pytorch:2.1.2-cuda12.1-cudnn8-runtime
+
+# LEAF + ViT/ConvNeXt image for HOPPER GPUs (H100, compute capability sm_90).
+#
+# Why this differs from leaf_vit.def (which targets an RTX 4070, sm_89):
+#
+#   TF 2.15 aborts on an H100 with
+#       Check failed: err == cudaSuccess (98 vs. 0)   in GetGpuLaunchConfig
+#   CUDA error 98 is cudaErrorInvalidDeviceFunction -- the kernels in those
+#   wheels have no sm_90 code. TF 2.17 ships Hopper kernels.
+#
+#   TF 2.16+ switched to Keras 3, but leaf_audio subclasses tf.keras layers in
+#   the Keras 2 style. Installing tf-keras restores that API; run_server.sh
+#   detects the tf_keras package and exports TF_USE_LEGACY_KERAS=1 for you.
+#
+# TensorFlow is here only for Run6/Run7. Run5 and Run8 are pure PyTorch, so
+# none of the sm_90/Keras trouble above applies to them -- on an H100, Run8 is
+# the path of least resistance.
+#
+# Run8 adds ConvNeXt (MODEL=convnext), which imports timm. It needs two symbols
+# that timm has moved and kept only as deprecated shims, so the build asserts
+# them rather than letting a queued job discover it.
+#
+# Build in the portal:
+#   Source          Singularity Definition File
+#   Definition File this file
+#   Name            leaf_vit_h100
+
+%post
+    set -e
+
+    apt-get update
+    apt-get install -y --no-install-recommends libsndfile1
+    rm -rf /var/lib/apt/lists/*
+
+    # One pip command so the resolver sees every pin at once -- timm added in a
+    # second command was free to drag numpy or torch with it.
+    #
+    # torchvision is pinned only because timm depends on it. The base image
+    # already ships 0.16.2 (the release matching torch 2.1.2), so this is
+    # normally a no-op; without it, pip is free to pick a torchvision whose own
+    # torch requirement upgrades torch off the base image's CUDA build.
+    pip install --no-cache-dir \
+        "tensorflow[and-cuda]==2.17.1" \
+        "tf-keras==2.17.0" \
+        "gin-config" \
+        "soundfile" \
+        "einops" \
+        "pandas" \
+        "numpy==1.26.4" \
+        "torchvision==0.16.2" \
+        "timm==1.0.24"
+
+    # Fail at build time rather than in a queued job. GPUs are not visible
+    # during the build, so this checks imports and versions only -- the sm_90
+    # kernels can only be proven by actually running on the H100.
+    TF_USE_LEGACY_KERAS=1 python - <<'PY'
+import os
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+import tensorflow as tf, torch, torchaudio, numpy, tf_keras, timm
+print("tensorflow", tf.__version__)
+print("tf_keras  ", tf_keras.__version__)
+print("torch     ", torch.__version__)
+print("torchaudio", torchaudio.__version__)
+print("timm      ", timm.__version__)
+print("numpy     ", numpy.__version__)
+# With TF_USE_LEGACY_KERAS=1 this must resolve to the Keras 2 API that
+# leaf_audio's layer subclasses expect.
+_ = tf.keras.layers.Conv1D
+assert tf.__version__.startswith("2.17"), "expected TF 2.17"
+assert numpy.__version__.startswith("1."), "keep numpy < 2"
+# torch comes from the base image. If pip has silently moved it, the CUDA
+# build may no longer match the driver on the node -- catch that here.
+assert torch.__version__.startswith("2.1.2"), "torch moved off the base image version"
+# leaf_pytorch (Run5/Run8) imports torchaudio, and its C extension only loads
+# against the exact torch it was built for.
+assert torchaudio.__version__.startswith("2.1"), "torchaudio must match torch 2.1.x"
+# The two timm symbols ConvNeXt/models/convnext.py imports. Both are deprecated
+# shims in timm 1.x; if a future timm drops them, Run8 MODEL=convnext breaks
+# and this is where it should surface.
+from timm.models.layers import trunc_normal_, DropPath
+from timm.models.registry import register_model
+print("tf.keras OK, timm shims OK")
+PY
+
+%environment
+    export TF_CPP_MIN_LOG_LEVEL=3
+    # TF 2.17 is Keras 3 by default; leaf_audio needs the Keras 2 API.
+    export TF_USE_LEGACY_KERAS=1
+
+%labels
+    Description LEAF (TensorFlow) + ViT/ConvNeXt (PyTorch), built for H100 / sm_90
+    TensorFlow 2.17.1
+    PyTorch 2.1.2+cu121
+    timm 1.0.24
+    Python 3.10
+
+%help
+    For Hopper GPUs. On sm_89 and older, leaf_vit.def (TF 2.15) is fine and
+    matches the local Docker image.
+
+    Run5/Run8 need only PyTorch; Run6/Run7 additionally need TensorFlow.
+    Run8 with MODEL=convnext also needs timm and the ConvNeXt/ folder from the
+    repo -- it is imported from the mounted project dir, not baked into the
+    image, so nothing here needs rebuilding when that code changes.
+
+    run_server.sh takes:  <dataset> <script> [VAR=VAL ...]
+
+      singularity exec --nv -B /nfs-share-stgnode/home/<user> \
+        --pwd /nfs-share-stgnode/home/<user>/Work \
+        leaf_vit_h100.sif bash run/run_server.sh cremad Run8.py MODEL=convnext

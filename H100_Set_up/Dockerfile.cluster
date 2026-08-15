@@ -1,0 +1,81 @@
+# Slim image for the university cluster: PACKAGES ONLY, no project code.
+#
+# The SLURM job runs with --pwd .../Workshop, so Python imports Run*.py,
+# Model/, leaf_pytorch/ and leaf_audio/ from there. Keeping the code out of the
+# image means editing a Run file never requires rebuilding or re-pushing it.
+#
+# Build and push from the Project folder:
+#
+#   docker build -f "Temp Scr/Dockerfile.cluster" -t YOURNAME/leaf-vit:latest .
+#   docker login
+#   docker push YOURNAME/leaf-vit:latest
+#
+# Then in the portal's Build dialog:
+#   Name        leaf-vit
+#   Workspace   (browse to your workspace)
+#   Source      Docker Registry
+#   Image Path  docker.io/YOURNAME/leaf-vit:latest
+#   Use HTTPS   checked
+#
+# The cluster pulls it directly -- nothing is uploaded through the browser.
+# The nvidia/cuda base layers already exist on Docker Hub, so `docker push`
+# only uploads your own layers.
+
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.10 \
+    python3-pip \
+    libsndfile1 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 \
+ && update-alternatives --install /usr/bin/pip pip /usr/bin/pip3 1
+
+RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# No project code imports torchvision, but timm (Run8 MODEL=convnext) depends on
+# it. Install it here from the cu121 index and pinned to the matching release:
+# left to pip, timm would pull the default PyPI torchvision, whose own torch
+# requirement can silently upgrade torch off 2.1.2+cu121.
+# Drop torchvision and timm together (~500 MB) if ConvNeXt is not needed.
+RUN pip install --no-cache-dir \
+    torch==2.1.2+cu121 \
+    torchaudio==2.1.2+cu121 \
+    torchvision==0.16.2+cu121 \
+    --index-url https://download.pytorch.org/whl/cu121
+
+RUN pip install --no-cache-dir "numpy<2.0"
+
+# Python 3.10 here, so TF 2.15.1 (Keras 2) installs cleanly -- the same version
+# the local Dockerfile uses, and the one leaf_audio's tf.keras subclasses expect.
+# tensorflow-addons and lingvo are deliberately absent: leaf_audio only needs
+# them for mean_var_norm / SpecAugment, which this project does not use.
+RUN pip install --no-cache-dir \
+    "tensorflow[and-cuda]==2.15.1" \
+    gin-config
+
+# JSON-array form is required: the folder name contains a space, and the plain
+# form does not treat the quotes as quoting -- BuildKit reads `"Temp` as an
+# unterminated string and refuses to build.
+COPY ["Temp Scr/requirements-cluster.txt", "/tmp/requirements.txt"]
+RUN pip install --no-cache-dir -r /tmp/requirements.txt && rm /tmp/requirements.txt
+
+# Same reasoning as leaf_vit_h100.def: fail the build rather than a queued job.
+RUN python - <<'PY'
+import torch, torchaudio, torchvision, timm
+print("torch", torch.__version__, "| torchaudio", torchaudio.__version__,
+      "| torchvision", torchvision.__version__, "| timm", timm.__version__)
+assert torch.__version__.startswith("2.1.2"), "timm/torchvision moved torch"
+# The two deprecated shims ConvNeXt/models/convnext.py imports.
+from timm.models.layers import trunc_normal_, DropPath
+from timm.models.registry import register_model
+print("timm shims OK")
+PY
+
+WORKDIR /workspace

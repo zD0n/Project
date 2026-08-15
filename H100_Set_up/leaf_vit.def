@@ -1,0 +1,69 @@
+Bootstrap: docker
+From: pytorch/pytorch:2.1.2-cuda12.1-cudnn8-runtime
+
+# Singularity definition for the LEAF + ViT project.
+#
+# Build it in the portal:
+#   Source          Singularity Definition File
+#   Definition File (browse to this file, uploaded to your workspace)
+#   Name            leaf_vit
+#
+# Why this base: torch 2.1.2 + CUDA 12.1 + Python 3.10. TF 2.15 supports python
+# 3.9-3.11 only, and it bundles Keras 2 -- which is what leaf_audio's
+# tf.keras.layers.Layer subclasses expect. A newer python or TF would need the
+# separate tf-keras package plus TF_USE_LEGACY_KERAS=1.
+#
+# Everything is quoted here, so none of it can be mangled the way the
+# Advanced -> Python Library textarea split each line into its own command.
+
+%post
+    set -e
+
+    # soundfile ships libsndfile in its manylinux wheel, but the system package
+    # costs almost nothing and removes the doubt.
+    apt-get update
+    apt-get install -y --no-install-recommends libsndfile1
+    rm -rf /var/lib/apt/lists/*
+
+    pip install --no-cache-dir \
+        "tensorflow[and-cuda]==2.15.1" \
+        "gin-config" \
+        "soundfile" \
+        "einops" \
+        "pandas" \
+        "numpy==1.26.4"
+
+    # Fail the build now if the two frameworks cannot coexist, rather than at
+    # 2am in a queued job. GPUs are not visible during build, so only the
+    # imports and versions are checked here.
+    python - <<'PY'
+import tensorflow as tf, torch, numpy, keras
+print("tensorflow", tf.__version__)
+print("keras     ", keras.__version__)
+print("torch     ", torch.__version__)
+print("numpy     ", numpy.__version__)
+assert tf.__version__.startswith("2.15"), "expected TF 2.15"
+assert keras.__version__.startswith("2."), "leaf_audio needs Keras 2"
+assert numpy.__version__.startswith("1."), "TF 2.15 needs numpy < 2"
+PY
+
+%environment
+    # Deliberately NOT setting TF_USE_LEGACY_KERAS: TF 2.15 has Keras 2 built
+    # in, and that variable makes it hunt for a separate tf_keras package,
+    # failing with "Keras cannot be imported".
+    export TF_CPP_MIN_LOG_LEVEL=3
+
+%labels
+    Description LEAF (TensorFlow) + ViT (PyTorch) for speech emotion recognition
+    TensorFlow 2.15.1
+    PyTorch 2.1.2+cu121
+    Python 3.10
+
+%help
+    Run a training script with the project mounted:
+
+      singularity exec --nv -B /nfs-share-stgnode/home/<user> \
+        --pwd /nfs-share-stgnode/home/<user>/Work \
+        leaf_vit.sif bash run/run_cremad_Run7.sh
+
+    Run5.py needs only PyTorch; Run6.py and Run7.py need TensorFlow too.

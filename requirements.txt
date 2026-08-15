@@ -13,3 +13,4 @@ numpy<=2.0.0
 einops
 librosa
 kymatio
+timm>=0.9

@@ -38,9 +38,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY FrontEnd/leaf_pytorch ./leaf_pytorch
 COPY leaf-audio/leaf_audio ./leaf_audio
 COPY Model ./Model
+# Only the model definitions -- the rest of the ConvNeXt repo is its ImageNet
+# training harness, which Run8 does not use.
+COPY ConvNeXt/models ./ConvNeXt/models
 COPY Run5.py .
 COPY Run6.py .
 COPY Run7.py .
-# Run5 = leaf_pytorch + VitGlobal; Run6 = TF leaf-audio + VitCnnGlobal.
+COPY Run8.py .
+# Run5 = leaf_pytorch + VitGlobal; Run6 = TF leaf-audio + VitCnnGlobal;
+# Run8 = leaf_pytorch + ViT or ConvNeXt (MODEL=convnext).
 
 CMD ["python", "Run5.py"]

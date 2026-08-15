@@ -10,3 +10,4 @@ __pycache__/
 Dataset2/
 leaf-audio/
 leaf_output/
+ConvNeXt/*

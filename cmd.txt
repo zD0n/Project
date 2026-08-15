@@ -2,3 +2,6 @@ docker build -t model .
 
 docker run --rm --gpus all -v "%cd%\Dataset\CREMA-D:/app/Dataset2" -v "%cd%\results:/app/results" -e BATCH_SIZE=8 -e FIXED_SECONDS=3 -e SEED=42 model python Run7.py
 docker run --rm --gpus all -v "%cd%\Dataset\CREMA-D:/app/Dataset2" -v "%cd%\results:/app/results" -e BATCH_SIZE=8 -e FIXED_SECONDS=3 -e SEED=42 -e MODEL=vit model python Run7.py
+
+docker run --rm --gpus all -v "%cd%\Dataset\CREMA-D:/app/Dataset2" -v "%cd%\results:/app/results" -e BATCH_SIZE=8 -e FIXED_SECONDS=3 -e SEED=42 -e MODEL=convnext model python Run8.py
+docker run --rm --gpus all -v "%cd%\Dataset\CREMA-D:/app/Dataset2" -v "%cd%\results:/app/results" -e BATCH_SIZE=8 -e FIXED_SECONDS=3 -e SEED=42 -e MODEL=convnext -e CONVNEXT_SIZE=small -e DROP_PATH=0.3 model python Run8.py

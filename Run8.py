@@ -2,7 +2,6 @@ import os
 import time
 import warnings
 
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 warnings.filterwarnings("ignore")
 
 import numpy as np
@@ -12,25 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn, optim
 
-import tensorflow as tf
-
-_gpus = tf.config.list_physical_devices("GPU")
-if os.environ.get("LEAF_ON_CPU", "0") not in ("0", "", "false", "False"):
-    tf.config.set_visible_devices([], "GPU")
-    _gpus = []
-    print("LEAF_ON_CPU=1 -> TensorFlow restricted to CPU (ViT stays on GPU)")
-
-for _g in _gpus:
-    try:
-        tf.config.experimental.set_memory_growth(_g, True)
-    except Exception:
-        pass
-tf.get_logger().setLevel("ERROR")
-
-import functools
-
-import leaf_audio.frontend as leaf_frontend_mod
-from leaf_audio import initializers
+from leaf_pytorch.frontend import Leaf
 from Model import VitCnnGlobal, VitCnnLocal, VitGlobal, VitLocal
 
 # ---------------------------------------------------------------------------
@@ -46,8 +27,8 @@ LABEL_ALIASES = {
     "neutral state": "neutral",
 }
 
-DATASET_DIR = "Dataset2"
-RESULT_DIR = "./results/LeafTF_ViT"
+DATASET_DIR = os.environ.get("DATASET_DIR", "Dataset2")
+RESULT_DIR = "./results/LeafTorch_ViT"
 SAMPLE_RATE = 16000
 
 
@@ -59,8 +40,8 @@ LEAF_N_FILTERS = _env("LEAF_N_FILTERS", 64, int)
 TARGET_SIZE = _env("TARGET_SIZE", 64, int)
 WINDOW_LEN = _env("WINDOW_LEN", 25, float)
 LEAF_LR = _env("LEAF_LR", 1e-5)
-LEAF_PREEMP = _env("LEAF_PREEMP", 1, int)        # TF LEAF supports pre-emphasis
-LEARN_POOLING = _env("LEARN_POOLING", 0, int)
+LEARN_POOLING = _env("LEARN_POOLING", 0, int)   # 0 freezes the Gaussian lowpass
+PCEN = _env("PCEN", 0, int)                     # 0 = log compression, as Run5/Run7
 
 NUM_EPOCHS = _env("NUM_EPOCHS", 30, int)
 BATCH_SIZE = _env("BATCH_SIZE", 32, int)
@@ -75,27 +56,26 @@ HEADS = _env("HEADS", 8, int)
 MLP_DIM = _env("MLP_DIM", 1024, int)
 PATCH = _env("PATCH", 8, int)
 DIM_HEAD = _env("DIM_HEAD", 64, int)
-CNN_CHANNELS = _env("CNN_CHANNELS", 64, int)     # CNN stem width (the "improved" part)
+CNN_CHANNELS = _env("CNN_CHANNELS", 64, int)
 DROPOUT = _env("DROPOUT", 0.2)
 EMB_DROPOUT = _env("EMB_DROPOUT", 0.1)
 
-
 COORD_CHANNELS = _env("COORD_CHANNELS", 1, int)
-
 SPEC_AUGMENT = _env("SPEC_AUGMENT", 1, int)
-FREQ_MASK = _env("FREQ_MASK", 8, int)     
-TIME_MASK = _env("TIME_MASK", 16, int)     
-
+FREQ_MASK = _env("FREQ_MASK", 8, int)
+TIME_MASK = _env("TIME_MASK", 16, int)
 NORMALIZE = _env("NORMALIZE", 1, int)
 
-# Which classifier to put on top of the LEAF features:
-#   vit            Model/VitGlobal      plain ViT, global attention, no CNN stem
-#   vit_local      Model/VitLocal       plain ViT, windowed local attention
-#   cnn_vit        Model/VitCnnGlobal   CNN stem + global attention  (default)
-#   cnn_vit_local  Model/VitCnnLocal    CNN stem + local attention
+# vit | vit_local | cnn_vit | cnn_vit_local | convnext  (see README)
 MODEL = os.environ.get("MODEL", "cnn_vit").lower()
-
 RESUME = _env("RESUME", 0, int)
+
+# ConvNeXt only (MODEL=convnext); ignored by the ViT variants.
+CONVNEXT_SIZE = os.environ.get("CONVNEXT_SIZE", "tiny").lower()
+DROP_PATH = _env("DROP_PATH", 0.1)          # stochastic depth, ConvNeXt-T default
+HEAD_INIT_SCALE = _env("HEAD_INIT_SCALE", 1.0)
+CONVNEXT_PRETRAINED = _env("CONVNEXT_PRETRAINED", 0, int)  # downloads ImageNet weights
+CONVNEXT_22K = _env("CONVNEXT_22K", 0, int)                # 22k instead of 1k weights
 
 SPLIT_MODE = os.environ.get("SPLIT_MODE", "speaker")
 TEST_FRAC = _env("TEST_FRAC", 0.2)
@@ -112,19 +92,16 @@ def set_seed(seed=42):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    tf.random.set_seed(seed)
 
 
 set_seed(SEED)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Torch device: {device}")
+print(f"Device: {device}")
 if device == "cuda":
     print(f"GPU: {torch.cuda.get_device_name(0)}")
-print(f"TensorFlow {tf.__version__} | GPUs visible to TF: {len(_gpus)}")
-if not _gpus:
-    print("WARNING: TensorFlow sees NO GPU -- the LEAF frontend will run on CPU.")
-    print("         Install a CUDA-enabled tensorflow build (see Dockerfile).")
+else:
+    print("WARNING: no CUDA device visible.")
 
 # ---------------------------------------------------------------------------
 # Dataset
@@ -201,7 +178,8 @@ lengths = np.array([a.shape[0] for a in all_audio])
 print(f"Loaded {len(all_audio)} files | max length: {lengths.max()} samples | "
       f"total {lengths.sum() / SAMPLE_RATE:.1f}s")
 
-
+# One fixed input length for every batch: variable shapes make the CUDA
+# allocator grow without bound and epochs get slower and slower.
 FIXED_SECONDS = _env("FIXED_SECONDS", 0.0)
 if FIXED_SECONDS <= 0:
     FIXED_SECONDS = min(6.0, max(2.0, float(np.percentile(lengths, 75)) / SAMPLE_RATE))
@@ -210,25 +188,10 @@ _trunc = int((lengths > FIXED_SAMPLES).sum())
 print(f"Fixed input window: {FIXED_SECONDS:.2f}s ({FIXED_SAMPLES} samples) | "
       f"{_trunc} of {len(lengths)} clips cropped ({_trunc / len(lengths) * 100:.1f}%)")
 
-
+# LEAF convolves at full waveform resolution before pooling to frames.
 _peak_gb = BATCH_SIZE * 2 * LEAF_N_FILTERS * FIXED_SAMPLES * 4 / 1e9
 print(f"LEAF peak intermediate: ~{_peak_gb:.2f} GB/copy "
       f"({BATCH_SIZE} x {2 * LEAF_N_FILTERS} x {FIXED_SAMPLES})")
-if _peak_gb > 0.5 and not _env("ALLOW_BIG_BATCH", 0, int):
-    _fit = max(2, int(0.25e9 // (2 * LEAF_N_FILTERS * FIXED_SAMPLES * 4)))
-    raise SystemExit(
-        "\nRefusing to start: the LEAF intermediate is ~{:.2f} GB per copy and the\n"
-        "backward pass holds several of them. This OOMs on a 12 GB GPU.\n"
-        "\n"
-        "  Why: TF LEAF runs its complex conv + squared modulus at FULL waveform\n"
-        "  resolution before pooling, so memory scales with\n"
-        "      BATCH_SIZE x (2 * LEAF_N_FILTERS) x samples x 4 bytes\n"
-        "  = {} x {} x {} x 4 = {:.2f} GB\n"
-        "\n"
-        "  Fix: add   -e BATCH_SIZE={} -e FIXED_SECONDS=3\n"
-        "  Override:  -e ALLOW_BIG_BATCH=1   (only on a larger GPU)\n"
-        .format(_peak_gb, BATCH_SIZE, 2 * LEAF_N_FILTERS, FIXED_SAMPLES,
-                _peak_gb, min(_fit, 8)))
 
 # ---------------------------------------------------------------------------
 # Split
@@ -264,7 +227,12 @@ if SPLIT_MODE == "speaker":
 
 
 def make_batch(indices, train=False):
+    """(B, FIXED_SAMPLES) -- one constant shape all run.
 
+    Clips longer than the window are cropped at a random offset while training
+    (free augmentation) and from the start at eval, so results are
+    deterministic. Shorter clips are zero-padded.
+    """
     batch = np.zeros((len(indices), FIXED_SAMPLES), dtype=np.float32)
     for j, i in enumerate(indices):
         x = all_audio[i]
@@ -278,137 +246,39 @@ def make_batch(indices, train=False):
 
 
 # ---------------------------------------------------------------------------
-# TF LEAF frontend (on GPU) + DLPack bridge
+# Frontend + feature pipeline
 # ---------------------------------------------------------------------------
-compression_fn = functools.partial(leaf_frontend_mod.log_compression, log_offset=1e-5)
-complex_conv_init = initializers.GaborInit(
-    sample_rate=SAMPLE_RATE, min_freq=60.0, max_freq=7800.0)
-
-leaf = leaf_frontend_mod.Leaf(
-    learn_pooling=bool(LEARN_POOLING),
+leaf = Leaf(
     n_filters=LEAF_N_FILTERS,
-    window_len=WINDOW_LEN,
     sample_rate=SAMPLE_RATE,
-    preemp=bool(LEAF_PREEMP),
-    compression_fn=compression_fn,
-    complex_conv_init=complex_conv_init,
-)
-# Build the Keras layer so trainable_variables exists before the optimizer.
-leaf(tf.zeros((1, SAMPLE_RATE), dtype=tf.float32), training=False)
+    window_len=WINDOW_LEN,
+    preemp=False,          # leaf_pytorch has no pre-emphasis layer
+    init_min_freq=60.0,
+    init_max_freq=7800.0,
+    pcen_compression=bool(PCEN),
+).to(device)
 
-def _leaf_is_finite():
-    return all(bool(np.isfinite(v.numpy()).all()) for v in leaf.trainable_variables)
+if not LEARN_POOLING:
+    for p in leaf._pooling.parameters():
+        p.requires_grad_(False)
 
-
-leaf_weights_path = os.path.join(RESULT_DIR, "leaf_weights.h5")
-
+leaf_weights_path = os.path.join(RESULT_DIR, "leaf_weights.pth")
+os.makedirs(RESULT_DIR, exist_ok=True)
 if RESUME and os.path.exists(leaf_weights_path):
-    leaf.load_weights(leaf_weights_path)
-    if _leaf_is_finite():
+    state = torch.load(leaf_weights_path, map_location=device)
+    if all(torch.isfinite(v).all() for v in state.values() if v.is_floating_point()):
+        leaf.load_state_dict(state)
         print(f"Loaded LEAF weights from {leaf_weights_path}")
     else:
-        print(f"REFUSED to resume: {leaf_weights_path} contains non-finite "
-              f"values. Re-initializing the frontend.")
-        leaf = leaf_frontend_mod.Leaf(
-            learn_pooling=bool(LEARN_POOLING), n_filters=LEAF_N_FILTERS,
-            window_len=WINDOW_LEN, sample_rate=SAMPLE_RATE,
-            preemp=bool(LEAF_PREEMP), compression_fn=compression_fn,
-            complex_conv_init=complex_conv_init)
-        leaf(tf.zeros((1, SAMPLE_RATE), dtype=tf.float32), training=False)
+        print("REFUSED to resume: saved LEAF weights are non-finite.")
 elif os.path.exists(leaf_weights_path):
-    print(f"Ignoring existing {os.path.basename(leaf_weights_path)} "
-          f"(set RESUME=1 to continue from it).")
-
-_use_dlpack = bool(_gpus) and device == "cuda"
-
-
-def tf_to_torch(t):
-
-    if _use_dlpack:
-        try:
-            from torch.utils import dlpack as tdl
-            return tdl.from_dlpack(tf.experimental.dlpack.to_dlpack(t)).clone()
-        except Exception:
-            pass
-    return torch.from_numpy(t.numpy()).to(device)
-
-
-def torch_to_tf(t):
-
-    t = t.contiguous()
-    if _use_dlpack:
-        try:
-            from torch.utils import dlpack as tdl
-            return tf.experimental.dlpack.from_dlpack(tdl.to_dlpack(t))
-        except Exception:
-            pass
-    return tf.constant(t.detach().cpu().numpy(), dtype=tf.float32)
-
-
-def leaf_forward(waveforms, training):
-
-    batch_tf = tf.constant(waveforms)
-    if training:
-        tape = tf.GradientTape()
-        with tape:
-            feats = leaf(batch_tf, training=True)
-            feats = tf.expand_dims(feats, -1)
-            feats = tf.image.resize(feats, (TARGET_SIZE, TARGET_SIZE))
-            feats = tf.squeeze(feats, -1)
-        return tape, feats
-    feats = leaf(batch_tf, training=False)
-    feats = tf.expand_dims(feats, -1)
-    feats = tf.image.resize(feats, (TARGET_SIZE, TARGET_SIZE))
-    return None, tf.squeeze(feats, -1)
-
-
-# ---------------------------------------------------------------------------
-# Model: CNN-stem ViT
-# ---------------------------------------------------------------------------
-_MODELS = {"vit": VitGlobal, "vit_local": VitLocal,
-           "cnn_vit": VitCnnGlobal, "cnn_vit_local": VitCnnLocal}
-if MODEL not in _MODELS:
-    raise SystemExit(f"MODEL={MODEL!r} unknown; choose one of {sorted(_MODELS)}")
-
-# The four variants take different kwargs: only the cnn_* ones accept
-# cnn_channels, and VitCnnLocal does not accept dim_head.
-_kw = dict(image_size=(TARGET_SIZE, TARGET_SIZE), patch_size=(PATCH, PATCH),
-           num_classes=NUM_CLASSES, dim=DIM, depth=DEPTH, heads=HEADS,
-           mlp_dim=MLP_DIM,
-           channels=VIT_CHANNELS,   # 1 LEAF plane + 2 CoordViT position planes
-           pool="cls", dropout=DROPOUT, emb_dropout=EMB_DROPOUT)
-if MODEL.startswith("cnn_"):
-    _kw["cnn_channels"] = CNN_CHANNELS
-if MODEL != "cnn_vit_local":
-    _kw["dim_head"] = DIM_HEAD
-
-vit_model = _MODELS[MODEL].ViT(**_kw).to(device)
-print(f"Model: {MODEL} ({_MODELS[MODEL].__name__})")
-
-print(f"Trainable params -- LEAF(tf): {sum(int(np.prod(v.shape)) for v in leaf.trainable_variables)}, "
-      f"ViT+CNN: {sum(p.numel() for p in vit_model.parameters())}")
-print(f"Methods: coord={COORD_CHANNELS} specaug={SPEC_AUGMENT} norm={NORMALIZE}")
-
-optimizer = optim.AdamW(vit_model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-leaf_optimizer = tf.keras.optimizers.Adam(learning_rate=LEAF_LR)
-criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
-
-
-def lr_scale(epoch):
-    if epoch < WARMUP_EPOCHS:
-        return float(epoch + 1) / max(1, WARMUP_EPOCHS)
-    p = (epoch - WARMUP_EPOCHS) / max(1, NUM_EPOCHS - WARMUP_EPOCHS)
-    return 0.5 * (1.0 + np.cos(np.pi * p))
-
-
-scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_scale)
-
+    print("Ignoring existing leaf_weights.pth (set RESUME=1 to continue from it).")
 
 _coord_cache = {}
 
 
 def coord_planes(b, h, w):
-
+    """CoordViT: normalized (time, freq) position as two extra input planes."""
     key = (h, w)
     if key not in _coord_cache:
         ys = torch.linspace(-1, 1, h, device=device).view(1, 1, h, 1).expand(1, 1, h, w)
@@ -418,7 +288,7 @@ def coord_planes(b, h, w):
 
 
 def spec_augment(x):
-
+    """SCQT-MaxViT style masking. Multiplicative, so autograd stays intact."""
     b, _, h, w = x.shape
     mask = torch.ones((b, 1, h, w), device=x.device, dtype=x.dtype)
     for i in range(b):
@@ -433,38 +303,146 @@ def spec_augment(x):
     return x * mask
 
 
-def prepare_features(feat_t, train):
-    """(B,1,H,W) from LEAF -> (B,VIT_CHANNELS,H,W) for the ViT.
+def leaf_features(waveforms, train):
+    """(B, T) numpy -> (B, VIT_CHANNELS, TARGET, TARGET) on `device`.
 
-    Everything here is differentiable w.r.t. feat_t, so dL/dfeatures still
-    reaches the TF tape and the Gabor filters keep learning.
+    leaf_pytorch emits (B, n_filters, frames) i.e. freq-major; the transpose
+    keeps time on rows, matching Run5/Run6/Run7.
     """
+    x = torch.from_numpy(waveforms).to(device, non_blocking=True).unsqueeze(1)
+    feats = leaf(x)                                # (B, n_filters, frames)
+    if not PCEN:
+        feats = torch.log(feats + 1e-5)
+    feats = feats.transpose(1, 2).unsqueeze(1)     # (B, 1, frames, n_filters)
+    feats = F.interpolate(feats, size=(TARGET_SIZE, TARGET_SIZE),
+                          mode="bilinear", align_corners=False)
     if NORMALIZE:
-        mean = feat_t.mean(dim=(-2, -1), keepdim=True)
-        std = feat_t.std(dim=(-2, -1), keepdim=True)
-        feat_t = (feat_t - mean) / (std + 1e-5)
+        mean = feats.mean(dim=(-2, -1), keepdim=True)
+        std = feats.std(dim=(-2, -1), keepdim=True)
+        feats = (feats - mean) / (std + 1e-5)
     if train and SPEC_AUGMENT:
-        feat_t = spec_augment(feat_t)
+        feats = spec_augment(feats)
     if COORD_CHANNELS:
-        b, _, h, w = feat_t.shape
-        feat_t = torch.cat([feat_t, coord_planes(b, h, w)], dim=1)
-    return feat_t
+        b, _, h, w = feats.shape
+        feats = torch.cat([feats, coord_planes(b, h, w)], dim=1)
+    return feats
+
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+_MODELS = {"vit": VitGlobal, "vit_local": VitLocal,
+           "cnn_vit": VitCnnGlobal, "cnn_vit_local": VitCnnLocal}
+
+_CONVNEXT_SIZES = {
+    "tiny":   dict(depths=[3, 3, 9, 3],  dims=[96, 192, 384, 768]),
+    "small":  dict(depths=[3, 3, 27, 3], dims=[96, 192, 384, 768]),
+    "base":   dict(depths=[3, 3, 27, 3], dims=[128, 256, 512, 1024]),
+    "large":  dict(depths=[3, 3, 27, 3], dims=[192, 384, 768, 1536]),
+    "xlarge": dict(depths=[3, 3, 27, 3], dims=[256, 512, 1024, 2048]),
+}
+
+
+def build_convnext():
+    """ConvNeXt from the vendored ./ConvNeXt checkout, on LEAF features.
+
+    The stem is stride-4 and each of the three later stages halves again, so
+    the map is TARGET_SIZE/32 before global pooling -- 2x2 at the default
+    TARGET_SIZE=64. Below 32 it collapses to nothing, hence the guard.
+
+    in_chans follows VIT_CHANNELS, so COORD_CHANNELS works here too: the
+    coordinate planes just become extra input channels on the stem.
+    """
+    from ConvNeXt.models.convnext import ConvNeXt, model_urls
+
+    if CONVNEXT_SIZE not in _CONVNEXT_SIZES:
+        raise SystemExit(f"CONVNEXT_SIZE={CONVNEXT_SIZE!r} unknown; "
+                         f"choose one of {sorted(_CONVNEXT_SIZES)}")
+    if TARGET_SIZE < 32:
+        raise SystemExit(f"TARGET_SIZE={TARGET_SIZE} is too small for ConvNeXt "
+                         "(4 stages downsample by 32x; use >= 32)")
+
+    model = ConvNeXt(in_chans=VIT_CHANNELS, num_classes=NUM_CLASSES,
+                     drop_path_rate=DROP_PATH, head_init_scale=HEAD_INIT_SCALE,
+                     **_CONVNEXT_SIZES[CONVNEXT_SIZE])
+
+    if CONVNEXT_PRETRAINED:
+        key = "convnext_{}_{}".format(CONVNEXT_SIZE, "22k" if CONVNEXT_22K else "1k")
+        if key not in model_urls:
+            raise SystemExit(f"No published weights for {key} "
+                             "(xlarge is 22k-only; set CONVNEXT_22K=1)")
+        state = torch.hub.load_state_dict_from_url(model_urls[key], map_location="cpu")["model"]
+        # Two mismatches against an ImageNet checkpoint: a 1000/21841-way head,
+        # and an RGB stem when VIT_CHANNELS is 1 or 3+coords.
+        state = {k: v for k, v in state.items() if not k.startswith("head.")}
+        stem = "downsample_layers.0.0.weight"
+        if state[stem].shape[1] != VIT_CHANNELS:
+            # Collapse RGB to one filter, then spread it over the real channel
+            # count so the summed stem response keeps its original scale.
+            state[stem] = (state[stem].mean(dim=1, keepdim=True)
+                           .repeat(1, VIT_CHANNELS, 1, 1) * (3.0 / VIT_CHANNELS))
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        print(f"Loaded {key}: {len(missing)} missing, {len(unexpected)} unexpected "
+              "(the head is expected to be missing)")
+    return model
+
+
+if MODEL == "convnext":
+    vit_model = build_convnext().to(device)
+    print(f"Model: convnext_{CONVNEXT_SIZE} (drop_path={DROP_PATH}, "
+          f"pretrained={CONVNEXT_PRETRAINED})")
+elif MODEL in _MODELS:
+    _kw = dict(image_size=(TARGET_SIZE, TARGET_SIZE), patch_size=(PATCH, PATCH),
+               num_classes=NUM_CLASSES, dim=DIM, depth=DEPTH, heads=HEADS,
+               mlp_dim=MLP_DIM, channels=VIT_CHANNELS, pool="cls",
+               dropout=DROPOUT, emb_dropout=EMB_DROPOUT)
+    if MODEL.startswith("cnn_"):
+        _kw["cnn_channels"] = CNN_CHANNELS
+    if MODEL != "cnn_vit_local":
+        _kw["dim_head"] = DIM_HEAD
+
+    vit_model = _MODELS[MODEL].ViT(**_kw).to(device)
+    print(f"Model: {MODEL} ({_MODELS[MODEL].__name__})")
+else:
+    raise SystemExit(f"MODEL={MODEL!r} unknown; "
+                     f"choose one of {sorted(list(_MODELS) + ['convnext'])}")
+
+
+leaf_trainable = [p for p in leaf.parameters() if p.requires_grad]
+print(f"Trainable params -- leaf: {sum(p.numel() for p in leaf_trainable)}, "
+      f"clf: {sum(p.numel() for p in vit_model.parameters())}")
+print(f"Methods: coord={COORD_CHANNELS} specaug={SPEC_AUGMENT} norm={NORMALIZE} "
+      f"pcen={PCEN}")
+
+# One optimizer, one autograd graph -- the frontend trains with the classifier.
+optimizer = optim.AdamW([
+    {"params": list(vit_model.parameters()), "lr": LR, "weight_decay": WEIGHT_DECAY},
+    {"params": leaf_trainable, "lr": LEAF_LR, "weight_decay": 0.0},
+])
+criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+
+
+def lr_scale(epoch):
+    if epoch < WARMUP_EPOCHS:
+        return float(epoch + 1) / max(1, WARMUP_EPOCHS)
+    p = (epoch - WARMUP_EPOCHS) / max(1, NUM_EPOCHS - WARMUP_EPOCHS)
+    return 0.5 * (1.0 + np.cos(np.pi * p))
+
+
+scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_scale)
 
 
 @torch.no_grad()
-def _predict(indices):
+def evaluate(indices):
+    """WA (accuracy) and UAR (mean per-class recall)."""
+    leaf.eval()
     vit_model.eval()
     preds = []
     for i in range(0, len(indices), BATCH_SIZE):
         idx = indices[i:i + BATCH_SIZE]
-        _, feats_tf = leaf_forward(make_batch(idx), training=False)
-        feat_t = tf_to_torch(feats_tf).float().unsqueeze(1).to(device)
-        preds.append(vit_model(prepare_features(feat_t, False)).argmax(1).cpu().numpy())
-    return np.concatenate(preds)
-
-
-def evaluate(indices):
-    preds = _predict(indices)
+        out = vit_model(leaf_features(make_batch(idx), train=False))
+        preds.append(out.argmax(1).cpu().numpy())
+    preds = np.concatenate(preds)
     tgts = all_labels[indices]
     wa = float((preds == tgts).mean())
     recalls = [float((preds[tgts == c] == c).mean())
@@ -473,20 +451,19 @@ def evaluate(indices):
 
 
 # ---------------------------------------------------------------------------
-# Training -- manual TF/torch chain rule
+# Training
 # ---------------------------------------------------------------------------
 n_train = len(train_idx)
 num_batches = (n_train + BATCH_SIZE - 1) // BATCH_SIZE
 print(f"\nTraining {NUM_EPOCHS} epoch(s) | {n_train} train samples | "
-      f"batch_size={BATCH_SIZE} | {num_batches} batches/epoch")
-print(f"TF<->torch transfer: {'DLPack (GPU-resident)' if _use_dlpack else 'numpy (CPU round trip)'}\n")
+      f"batch_size={BATCH_SIZE} | {num_batches} batches/epoch\n")
 
-os.makedirs(RESULT_DIR, exist_ok=True)
 best_path = os.path.join(RESULT_DIR, "best.pth")
 train_log, best_uar = [], -1.0
 
 for epoch in range(NUM_EPOCHS):
     t0 = time.time()
+    leaf.train()
     vit_model.train()
     perm = train_idx[np.random.permutation(n_train)]
     epoch_loss, epoch_correct = 0.0, 0
@@ -495,66 +472,20 @@ for epoch in range(NUM_EPOCHS):
         idx = perm[b * BATCH_SIZE:min((b + 1) * BATCH_SIZE, n_train)]
         bs = len(idx)
 
-
-        tape, feats_tf = leaf_forward(make_batch(idx, train=True), training=True)
-
-
-        feat_t = tf_to_torch(feats_tf).float().unsqueeze(1).to(device)
-        feat_t.requires_grad_(True)
+        x_in = leaf_features(make_batch(idx, train=True), train=True)
         target_t = torch.tensor(all_labels[idx], dtype=torch.long, device=device)
 
-
         optimizer.zero_grad(set_to_none=True)
-        x_in = prepare_features(feat_t, True)
-
         output = vit_model(x_in)
         loss = criterion(output, target_t)
 
-        if epoch == 0 and b == 0:
-            def _stat(name, t):
-                t = t.detach()
-                ok = bool(torch.isfinite(t).all())
-                print("  [check] {:<22s} finite={:<5} min={:+.4g} max={:+.4g} "
-                      "mean={:+.4g}".format(
-                          name, str(ok), float(t.min()), float(t.max()),
-                          float(t.float().mean())))
-                return ok
-            print("first-batch sanity check:")
-            _leaf_np = feats_tf.numpy()
-            print("  [check] {:<22s} finite={:<5} min={:+.4g} max={:+.4g}".format(
-                "leaf output (TF)", str(bool(np.isfinite(_leaf_np).all())),
-                float(np.nanmin(_leaf_np)), float(np.nanmax(_leaf_np))))
-            _stat("after tf_to_torch", feat_t)
-            _stat("after prepare", x_in)
-            _stat("vit output", output)
-            _stat("loss", loss)
-
-        loss.backward()
+        loss.backward()      # reaches the Gabor filters directly -- one graph
         optimizer.step()
-
-
-        if epoch == 0 and b == 0 and feat_t.grad is not None:
-            print("  [check] {:<22s} finite={}".format(
-                "dL/dfeatures", bool(torch.isfinite(feat_t.grad).all())))
-        grad_tf = torch_to_tf(feat_t.grad.squeeze(1))
-        leaf_grads = tape.gradient(feats_tf, leaf.trainable_variables,
-                                   output_gradients=grad_tf)
-        if epoch == 0 and b == 0:
-            for _g, _v in zip(leaf_grads, leaf.trainable_variables):
-                if _g is not None:
-                    print("  [check] leaf grad {:<12s} finite={}".format(
-                        _v.name[:12], bool(np.isfinite(_g.numpy()).all())))
-        pairs = [(g, v) for g, v in zip(leaf_grads, leaf.trainable_variables)
-                 if g is not None]
-        if pairs:
-            leaf_optimizer.apply_gradients(pairs)
-        del tape
 
         epoch_loss += loss.item() * bs
         epoch_correct += (output.argmax(1) == target_t).sum().item()
 
     scheduler.step()
-
     if device == "cuda":
         torch.cuda.empty_cache()
     avg_loss = epoch_loss / n_train
@@ -568,14 +499,12 @@ for epoch in range(NUM_EPOCHS):
                       "time_s": round(elapsed, 1)})
 
     star = ""
-
     if not np.isfinite(avg_loss):
         star = "  !! non-finite loss -- not checkpointing"
     elif val_uar > best_uar:
         best_uar = val_uar
         torch.save({"vit": vit_model.state_dict()}, best_path)
-        if _leaf_is_finite():
-            leaf.save_weights(leaf_weights_path)
+        torch.save(leaf.state_dict(), leaf_weights_path)
         star = "  <- best"
     print(f"Epoch [{epoch + 1}/{NUM_EPOCHS}]  loss={avg_loss:.4f}  train={acc:.1f}%  "
           f"val_WA={val_wa * 100:.1f}%  val_UAR={val_uar * 100:.1f}%  "
@@ -585,13 +514,13 @@ for epoch in range(NUM_EPOCHS):
 # Test on the best-val checkpoint
 # ---------------------------------------------------------------------------
 vit_model.load_state_dict(torch.load(best_path, map_location=device)["vit"])
-leaf.load_weights(leaf_weights_path)
+leaf.load_state_dict(torch.load(leaf_weights_path, map_location=device))
 
 test_wa, test_uar, test_preds, test_targets = evaluate(test_idx)
 train_wa, _, _, _ = evaluate(train_idx)
 
 print("\n" + "=" * 66)
-print(f"TEST -- TF LEAF + VitCnnGlobal | {DATASET} | {SPLIT_MODE} split | "
+print(f"TEST -- leaf_pytorch + {MODEL} | {DATASET} | {SPLIT_MODE} split | "
       f"{len(test_idx)} clips")
 print(f"  WA  {test_wa * 100:.2f}%")
 print(f"  UAR {test_uar * 100:.2f}%   (chance = {100 / NUM_CLASSES:.1f}%)")
@@ -599,9 +528,6 @@ print(f"  train WA {train_wa * 100:.2f}%  ->  generalization gap "
       f"{(train_wa - test_wa) * 100:.1f} points")
 print("=" * 66)
 
-# ---------------------------------------------------------------------------
-# Confusion matrix + logs
-# ---------------------------------------------------------------------------
 rev_map = {v: k for k, v in EMOTION_MAP.items()}
 cm = np.zeros((NUM_CLASSES, NUM_CLASSES), dtype=int)
 for t, p in zip(test_targets, test_preds):
@@ -616,18 +542,20 @@ print(cm_df.to_string())
 cm_df.to_csv(os.path.join(RESULT_DIR, "confusion_matrix.csv"))
 pd.DataFrame(train_log).to_csv(os.path.join(RESULT_DIR, "training_log.csv"), index=False)
 
-run = {"frontend": "leaf-audio-tf", "model": MODEL, "dataset": DATASET,
+run = {"frontend": "leaf_pytorch", "model": MODEL, "dataset": DATASET,
        "classes": NUM_CLASSES, "split_mode": SPLIT_MODE, "epochs": NUM_EPOCHS,
        "batch": BATCH_SIZE, "lr": LR, "leaf_lr": LEAF_LR,
        "weight_decay": WEIGHT_DECAY, "label_smoothing": LABEL_SMOOTHING,
        "dropout": DROPOUT, "emb_dropout": EMB_DROPOUT, "dim": DIM, "depth": DEPTH,
        "heads": HEADS, "mlp_dim": MLP_DIM, "patch": PATCH, "dim_head": DIM_HEAD,
        "cnn_channels": CNN_CHANNELS, "target_size": TARGET_SIZE,
+       "leaf_filters": LEAF_N_FILTERS, "learn_pooling": LEARN_POOLING, "pcen": PCEN,
        "coord_channels": COORD_CHANNELS, "spec_augment": SPEC_AUGMENT,
        "freq_mask": FREQ_MASK, "time_mask": TIME_MASK, "normalize": NORMALIZE,
-       "fixed_seconds": FIXED_SECONDS,
-       "leaf_filters": LEAF_N_FILTERS, "preemp": LEAF_PREEMP,
-       "learn_pooling": LEARN_POOLING, "seed": SEED,
+       "convnext_size": CONVNEXT_SIZE if MODEL == "convnext" else "",
+       "drop_path": DROP_PATH if MODEL == "convnext" else "",
+       "convnext_pretrained": CONVNEXT_PRETRAINED if MODEL == "convnext" else "",
+       "fixed_seconds": FIXED_SECONDS, "seed": SEED,
        "best_val_uar": best_uar * 100, "test_wa": test_wa * 100,
        "test_uar": test_uar * 100, "train_wa": train_wa * 100}
 sweep = os.path.join(RESULT_DIR, "sweep.csv")

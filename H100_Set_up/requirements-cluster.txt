@@ -1,0 +1,17 @@
+# Only what Run5/Run6/Run7/Run8 actually import.
+#
+# Dropped from the local requirements.txt because nothing imports them:
+#   torch-audiomentations, msgpack, msgpack-numpy, wandb, transformers,
+#   lmdb, kymatio, librosa, matplotlib
+# transformers alone pulls ~2 GB of dependencies and only ever printed a
+# warning at startup.
+numpy<2.0
+pandas
+SoundFile
+einops
+# Run8 MODEL=convnext only. Pinned because ConvNeXt imports timm.models.layers
+# and timm.models.registry, which are deprecated shims in timm 1.x.
+# NOTE: timm depends on torchvision, so this is no longer a torchvision-free
+# install -- Dockerfile.cluster pins torchvision==0.16.2+cu121 to keep pip from
+# resolving a PyPI build that would upgrade torch.
+timm==1.0.24

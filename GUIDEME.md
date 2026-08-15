@@ -9,15 +9,19 @@ recognition, on CREMA-D and IEMOCAP.
 | `Run5.py` | `FrontEnd/leaf_pytorch` (PyTorch) | `VitGlobal` | `results/Leaf_VitGlobal/<dataset>/` |
 | `Run6.py` | `leaf-audio/leaf_audio` (TensorFlow, GPU) | `VitCnnGlobal` | `results/LeafTF_VitCnnGlobal/<dataset>/` |
 | `Run7.py` | same as Run6 | `VitCnnGlobal` | `results/LeafTF_VitCnnGlobal_Coord/<dataset>/` |
+| `Run8.py` | `FrontEnd/leaf_pytorch` (PyTorch) | `VitCnnGlobal` | `results/LeafTorch_ViT/<dataset>/` |
 
 `Run7` = `Run6` plus methods drawn from the papers in `../Reasearch`: CoordViT
-coordinate planes, SCQT-MaxViT time/frequency masking, per-sample
-normalization, stochastic depth, and mixup. Each is a flag, so they can be
-ablated one at a time.
+coordinate planes, SCQT-MaxViT time/frequency masking, and per-sample
+normalization. Each is a flag, so they can be ablated one at a time.
+
+`Run8` = `Run7`'s experiment with no TensorFlow: the same methods on the PyTorch
+LEAF port, so frontend and classifier share one autograd graph on one device. It
+is also the only script that can run **ConvNeXt** (`MODEL=convnext`).
 
 ## `MODEL` — classifier variant
 
-Selectable in `Run6.py` and `Run7.py` via `-e MODEL=...`:
+Selectable in `Run6.py`, `Run7.py` and `Run8.py` via `-e MODEL=...`:
 
 | `MODEL=` | Class | What it is |
 |---|---|---|
@@ -25,6 +29,36 @@ Selectable in `Run6.py` and `Run7.py` via `-e MODEL=...`:
 | `vit_local` | `VitLocal` | plain ViT, windowed local attention |
 | `cnn_vit` | `VitCnnGlobal` | CNN stem + global attention (default) |
 | `cnn_vit_local` | `VitCnnLocal` | CNN stem + local attention |
+| `convnext` | `ConvNeXt` | pure conv, no attention — **`Run8.py` only** |
+
+### `MODEL=convnext`
+
+Runs [facebookresearch/ConvNeXt](https://github.com/facebookresearch/ConvNeXt),
+vendored unmodified at `ConvNeXt/`, on the same LEAF features. The frontend,
+split, SpecAugment and eval are untouched, so a `convnext` row in `sweep.csv` is
+comparable to a `cnn_vit` row on everything but the classifier.
+
+| var | default | notes |
+|---|---|---|
+| `CONVNEXT_SIZE` | `tiny` | `tiny` `small` `base` `large` `xlarge` |
+| `DROP_PATH` | 0.1 | stochastic depth; raise it if train/test gap is wide |
+| `CONVNEXT_PRETRAINED` | 0 | 1 downloads ImageNet weights (~110 MB for tiny) |
+| `CONVNEXT_22K` | 0 | with the above, ImageNet-22k instead of 1k |
+
+Two things to know before comparing it to the ViTs:
+
+- **It is much bigger.** ConvNeXt-T is 27.8M parameters against `cnn_vit`'s
+  7.46M, on ~5k training clips. Expect it to overfit unless you raise
+  `DROP_PATH` / `WEIGHT_DECAY`, and do not read a lower UAR as "ConvNeXt is
+  worse" without matching capacity.
+- **The stem is aggressive for a 64×64 input.** Four stages downsample by 32×,
+  so the map is 2×2 before global pooling. `TARGET_SIZE` below 32 is rejected;
+  `TARGET_SIZE=128` gives it a 4×4 map to pool over.
+
+`COORD_CHANNELS` works here too — the coordinate planes become extra stem input
+channels. With `CONVNEXT_PRETRAINED=1` and `COORD_CHANNELS=1` the input is 3
+channels, so the RGB stem loads as-is; at 1 channel it is averaged and rescaled.
+The classifier head is always trained from scratch (6 or 5 classes, not 1000).
 
 **`vit_local` requires `-e DIM_HEAD=32`.** `Model/VitLocal.py` mixes two
 definitions of head width — the qkv projection uses the constructor's
@@ -44,10 +78,16 @@ docker build -t model .
 docker run --rm --gpus all -v "${PWD}\Dataset\IEMOCAP:/app/Dataset2" -v "${PWD}\results:/app/results" -e BATCH_SIZE=8 -e FIXED_SECONDS=3 model python Run7.py
 ```
 
-The image defaults to `Run5.py`; pass `python Run6.py` / `python Run7.py`
-explicitly for the others. `BATCH_SIZE=8 FIXED_SECONDS=3` is required for
-Run6/Run7 — the TensorFlow LEAF runs its convolution at full waveform
-resolution and OOMs on 12 GB at the defaults.
+The image defaults to `Run5.py`; pass `python Run6.py` / `python Run7.py` /
+`python Run8.py` explicitly for the others. `BATCH_SIZE=8 FIXED_SECONDS=3` is
+required for Run6/Run7 — the TensorFlow LEAF runs its convolution at full
+waveform resolution and OOMs on 12 GB at the defaults.
+
+ConvNeXt run, otherwise identical to a Run8 ViT run:
+
+```
+docker run --rm --gpus all -v "${PWD}\Dataset\CREMA-D:/app/Dataset2" -v "${PWD}\results:/app/results" -e BATCH_SIZE=8 -e FIXED_SECONDS=3 -e MODEL=convnext model python Run8.py
+```
 
 Rebuild after editing any `Run*.py`, `Model/`, `leaf-audio/`, `Dockerfile` or
 `requirements.txt`. Environment variables alone need no rebuild.
@@ -60,9 +100,9 @@ Rebuild after editing any `Run*.py`, `Model/`, `leaf-audio/`, `Dockerfile` or
 | `BATCH_SIZE` | 32 | use 8 for Run6/Run7 |
 | `FIXED_SECONDS` | 0 = auto (p75, capped 6s) | one fixed input window for every batch |
 | `LR` / `LEAF_LR` | 3e-4 / 1e-5 | frontend learns much slower than the head |
-| `MODEL` | `cnn_vit` | see table above (Run6/Run7) |
-| `POOL` | `cls` | `mean` pools all tokens instead (Run7) |
-| `COORD_CHANNELS` `SPEC_AUGMENT` `DROP_PATH` `MIXUP_ALPHA` | 1, 1, 0.1, 0.2 | Run7 methods; 0 disables |
+| `MODEL` | `cnn_vit` | see table above (Run6/Run7/Run8) |
+| `TARGET_SIZE` | 64 | feature map fed to the classifier; `convnext` needs ≥ 32 |
+| `COORD_CHANNELS` `SPEC_AUGMENT` | 1, 1 | Run7 methods; 0 disables |
 | `SPLIT_MODE` | `speaker` | `random` leaks speakers — for measuring that leak only |
 | `DATASET` | `auto` | inferred from the label vocabulary |
 | `RESUME` | 0 | 1 continues from the previous run's LEAF weights |

@@ -16,6 +16,11 @@ import tensorflow as tf
 
 
 _gpus = tf.config.list_physical_devices("GPU")
+if os.environ.get("LEAF_ON_CPU", "0") not in ("0", "", "false", "False"):
+    tf.config.set_visible_devices([], "GPU")
+    _gpus = []
+    print("LEAF_ON_CPU=1 -> TensorFlow restricted to CPU (ViT stays on GPU)")
+
 for _g in _gpus:
     try:
         tf.config.experimental.set_memory_growth(_g, True)
