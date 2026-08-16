@@ -28,8 +28,18 @@ LABEL_ALIASES = {
 }
 
 DATASET_DIR = os.environ.get("DATASET_DIR", "Dataset2")
-RESULT_DIR = "./results/LeafTorch_ViT"
 SAMPLE_RATE = 16000
+
+# leaf = learnable LEAF frontend (trains with the classifier).
+# mel  = fixed log-mel filterbank, the classical baseline LEAF is measured
+#        against. Same output contract, same downstream pipeline, so the two
+#        differ only in the frontend.
+FRONTEND = os.environ.get("FRONTEND", "leaf").lower()
+if FRONTEND not in ("leaf", "mel"):
+    raise SystemExit(f"FRONTEND={FRONTEND!r} unknown; choose 'leaf' or 'mel'")
+# Separate result dirs, or a mel run overwrites a leaf run's checkpoints and
+# appends to its sweep.csv.
+RESULT_DIR = "./results/{}Torch_ViT".format("Leaf" if FRONTEND == "leaf" else "Mel")
 
 
 def _env(name, default, cast=float):
@@ -248,19 +258,59 @@ def make_batch(indices, train=False):
 # ---------------------------------------------------------------------------
 # Frontend + feature pipeline
 # ---------------------------------------------------------------------------
-leaf = Leaf(
-    n_filters=LEAF_N_FILTERS,
-    sample_rate=SAMPLE_RATE,
-    window_len=WINDOW_LEN,
-    preemp=False,          # leaf_pytorch has no pre-emphasis layer
-    init_min_freq=60.0,
-    init_max_freq=7800.0,
-    pcen_compression=bool(PCEN),
-).to(device)
+class MelFrontend(nn.Module):
+    """Fixed log-mel filterbank with the same contract as Leaf:
 
-if not LEARN_POOLING:
-    for p in leaf._pooling.parameters():
-        p.requires_grad_(False)
+        (B, 1, T) -> (B, n_filters, frames), strictly positive.
+
+    Deliberately not learnable -- that is the point of the comparison. It is
+    still a torch module on `device`, so the batch never leaves the GPU and the
+    rest of the pipeline is byte-for-byte the same code as the LEAF path.
+    """
+
+    def __init__(self, n_filters, sample_rate, window_len, window_stride=10.0):
+        super().__init__()
+        import torchaudio
+        # LEAF convolves over a 25 ms window and pools to a 10 ms hop; match
+        # both so the two frontends emit the same number of frames.
+        win = int(round(sample_rate * window_len / 1000.0))
+        n_fft = 1 << (win - 1).bit_length()          # next power of two >= win
+        self.mel = torchaudio.transforms.MelSpectrogram(
+            sample_rate=sample_rate,
+            n_fft=n_fft,
+            win_length=win,
+            hop_length=int(round(sample_rate * window_stride / 1000.0)),
+            n_mels=n_filters,
+            f_min=60.0,          # same band as the LEAF Gabor init
+            f_max=7800.0,
+            power=2.0,
+        )
+
+    def forward(self, x):
+        # 1e-6 keeps the log downstream finite on digital silence.
+        return self.mel(x.squeeze(1)) + 1e-6
+
+
+if FRONTEND == "mel":
+    leaf = MelFrontend(
+        n_filters=LEAF_N_FILTERS,
+        sample_rate=SAMPLE_RATE,
+        window_len=WINDOW_LEN,
+    ).to(device)
+else:
+    leaf = Leaf(
+        n_filters=LEAF_N_FILTERS,
+        sample_rate=SAMPLE_RATE,
+        window_len=WINDOW_LEN,
+        preemp=False,          # leaf_pytorch has no pre-emphasis layer
+        init_min_freq=60.0,
+        init_max_freq=7800.0,
+        pcen_compression=bool(PCEN),
+    ).to(device)
+
+    if not LEARN_POOLING:
+        for p in leaf._pooling.parameters():
+            p.requires_grad_(False)
 
 leaf_weights_path = os.path.join(RESULT_DIR, "leaf_weights.pth")
 os.makedirs(RESULT_DIR, exist_ok=True)
@@ -311,7 +361,9 @@ def leaf_features(waveforms, train):
     """
     x = torch.from_numpy(waveforms).to(device, non_blocking=True).unsqueeze(1)
     feats = leaf(x)                                # (B, n_filters, frames)
-    if not PCEN:
+    # PCEN is a LEAF option; mel always log-compresses, otherwise raw power
+    # spectra would reach the classifier.
+    if FRONTEND == "mel" or not PCEN:
         feats = torch.log(feats + 1e-5)
     feats = feats.transpose(1, 2).unsqueeze(1)     # (B, 1, frames, n_filters)
     feats = F.interpolate(feats, size=(TARGET_SIZE, TARGET_SIZE),
@@ -409,16 +461,20 @@ else:
 
 
 leaf_trainable = [p for p in leaf.parameters() if p.requires_grad]
-print(f"Trainable params -- leaf: {sum(p.numel() for p in leaf_trainable)}, "
+print(f"Frontend: {FRONTEND}")
+print(f"Trainable params -- frontend: {sum(p.numel() for p in leaf_trainable)}, "
       f"clf: {sum(p.numel() for p in vit_model.parameters())}")
 print(f"Methods: coord={COORD_CHANNELS} specaug={SPEC_AUGMENT} norm={NORMALIZE} "
       f"pcen={PCEN}")
 
-# One optimizer, one autograd graph -- the frontend trains with the classifier.
-optimizer = optim.AdamW([
-    {"params": list(vit_model.parameters()), "lr": LR, "weight_decay": WEIGHT_DECAY},
-    {"params": leaf_trainable, "lr": LEAF_LR, "weight_decay": 0.0},
-])
+# One optimizer, one autograd graph -- a learnable frontend trains with the
+# classifier. mel has no parameters at all, so it contributes no group: an
+# empty one would leave LEAF_LR in the logs implying something was training.
+_groups = [{"params": list(vit_model.parameters()), "lr": LR,
+            "weight_decay": WEIGHT_DECAY}]
+if leaf_trainable:
+    _groups.append({"params": leaf_trainable, "lr": LEAF_LR, "weight_decay": 0.0})
+optimizer = optim.AdamW(_groups)
 criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
 
 
@@ -520,7 +576,7 @@ test_wa, test_uar, test_preds, test_targets = evaluate(test_idx)
 train_wa, _, _, _ = evaluate(train_idx)
 
 print("\n" + "=" * 66)
-print(f"TEST -- leaf_pytorch + {MODEL} | {DATASET} | {SPLIT_MODE} split | "
+print(f"TEST -- {FRONTEND} + {MODEL} | {DATASET} | {SPLIT_MODE} split | "
       f"{len(test_idx)} clips")
 print(f"  WA  {test_wa * 100:.2f}%")
 print(f"  UAR {test_uar * 100:.2f}%   (chance = {100 / NUM_CLASSES:.1f}%)")
@@ -542,7 +598,7 @@ print(cm_df.to_string())
 cm_df.to_csv(os.path.join(RESULT_DIR, "confusion_matrix.csv"))
 pd.DataFrame(train_log).to_csv(os.path.join(RESULT_DIR, "training_log.csv"), index=False)
 
-run = {"frontend": "leaf_pytorch", "model": MODEL, "dataset": DATASET,
+run = {"frontend": FRONTEND, "model": MODEL, "dataset": DATASET,
        "classes": NUM_CLASSES, "split_mode": SPLIT_MODE, "epochs": NUM_EPOCHS,
        "batch": BATCH_SIZE, "lr": LR, "leaf_lr": LEAF_LR,
        "weight_decay": WEIGHT_DECAY, "label_smoothing": LABEL_SMOOTHING,

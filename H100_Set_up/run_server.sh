@@ -22,11 +22,39 @@ set -e
 [ $# -gt 0 ] && { SCRIPT=$1; shift; }
 [ $# -gt 0 ] && EXTRA="$*"
 
+# `all` in the script slot runs the full 3-classifier x 2-frontend sweep on
+# Run8 instead of a single experiment -- one portal submission, six results.
+# Everything else (setup, preflight, EXTRA) behaves identically.
+SWEEP=0
+if [ "$SCRIPT" = "all" ] || [ "$SCRIPT" = "sweep" ]; then
+    SWEEP=1
+    SCRIPT=Run8.py
+fi
+
+# Maps a corpus name to its folder under Dataset/. Echoes the folder, or
+# nothing if the name is not recognised.
+_data_dir_for() {
+    case "$1" in
+        cremad|CREMA-D|crema-d) echo CREMA-D ;;
+        iemocap|IEMOCAP)        echo IEMOCAP ;;
+    esac
+}
+
+# `all`/`both` in the dataset slot runs every corpus. With `all` in the script
+# slot too, that is 6 combinations x 2 corpora = 12 runs.
 case "$DATASET" in
-    cremad|CREMA-D|crema-d) DATA_DIR=CREMA-D ;;
-    iemocap|IEMOCAP)        DATA_DIR=IEMOCAP ;;
-    *) echo "unknown DATASET '$DATASET' (use iemocap or cremad)" >&2; exit 1 ;;
+    all|both) DATASETS="cremad iemocap" ;;
+    *)        DATASETS="$DATASET" ;;
 esac
+
+for _ds in $DATASETS; do
+    if [ -z "$(_data_dir_for "$_ds")" ]; then
+        echo "unknown DATASET '$_ds' (use iemocap, cremad, or all)" >&2
+        exit 1
+    fi
+done
+# Kept for the single-run path below; the sweep re-points it per corpus.
+DATA_DIR=$(_data_dir_for "${DATASETS%% *}")
 
 # Find the folder holding Run*.py / Model/ / Dataset/. Singularity's --pwd
 # usually puts us there already; fall back to this script's directory and its
@@ -48,14 +76,26 @@ fi
 cd "$PROJECT_DIR"
 echo "working dir: $(pwd)"
 
-# The Run*.py scripts hardcode DATASET_DIR = "Dataset2", so point a symlink at
-# whichever corpus was chosen instead of editing the code.
-if [ ! -d "Dataset/$DATA_DIR" ]; then
-    echo "error: Dataset/$DATA_DIR not found in $(pwd)" >&2
-    exit 1
-fi
-rm -f Dataset2
-ln -s "Dataset/$DATA_DIR" Dataset2
+# The Run*.py scripts default DATASET_DIR to "Dataset2", so point a symlink at
+# whichever corpus is being run instead of editing the code. The sweep calls
+# this again between corpora.
+_point_dataset() {
+    if [ ! -d "Dataset/$1" ]; then
+        echo "error: Dataset/$1 not found in $(pwd)" >&2
+        return 1
+    fi
+    rm -f Dataset2
+    ln -s "Dataset/$1" Dataset2
+}
+
+# Fail now if any requested corpus is missing -- a 12-run sweep should not die
+# hours in because the second one was never uploaded.
+for _ds in $DATASETS; do
+    _dd=$(_data_dir_for "$_ds")
+    [ -d "Dataset/$_dd" ] || { echo "error: Dataset/$_dd not found in $(pwd)" >&2; exit 1; }
+done
+
+_point_dataset "$DATA_DIR"
 mkdir -p results
 
 # Python cannot import a package from a hyphenated directory. The upstream repo
@@ -156,7 +196,7 @@ esac
 # Run8 MODEL=convnext imports timm, and the model code itself from the mounted
 # ConvNeXt/ folder. Both fail well into the run -- after the whole corpus has
 # been loaded -- so check them up front.
-if [ "$SCRIPT" = "Run8.py" ] && [ "${MODEL:-}" = "convnext" ]; then
+if [ "$SCRIPT" = "Run8.py" ] && { [ "${MODEL:-}" = "convnext" ] || [ "$SWEEP" = "1" ]; }; then
     [ -f ConvNeXt/models/convnext.py ] || {
         echo "error: MODEL=convnext needs ConvNeXt/models/convnext.py under $(pwd)." >&2
         echo "       Upload the repo's ConvNeXt/ folder alongside Run8.py." >&2
@@ -201,5 +241,87 @@ from timm.models.registry import register_model" 2>/dev/null
     }
 fi
 
-echo "== $SCRIPT on $DATA_DIR | BATCH_SIZE=$BATCH_SIZE FIXED_SECONDS=$FIXED_SECONDS $EXTRA =="
-exec $PY "$SCRIPT"
+if [ "$SWEEP" != "1" ]; then
+    echo "== $SCRIPT on $DATA_DIR | BATCH_SIZE=$BATCH_SIZE FIXED_SECONDS=$FIXED_SECONDS $EXTRA =="
+    exec $PY "$SCRIPT"
+fi
+
+# ---------------------------------------------------------------------------
+# Sweep: 3 classifiers x 2 frontends, one process each.
+#
+# Sequential, not parallel: they share one GPU, and interleaving them would
+# make the per-epoch timings in training_log.csv meaningless as a comparison.
+#
+# Each combination is its own process so a crash in one cannot corrupt the
+# next -- the loop records the failure and carries on, and the summary at the
+# end is the authority on what actually completed. EXTRA still applies to every
+# run, so `... all NUM_EPOCHS=2` smoke-tests the whole grid.
+#
+# The 224 x batch-32 ConvNeXt runs live in run_<corpus>_224.sh, not here.
+# ---------------------------------------------------------------------------
+export NUM_EPOCHS=${NUM_EPOCHS:-30}
+export SEED=${SEED:-42}
+
+_combos="leaf:vit leaf:cnn_vit leaf:convnext mel:vit mel:cnn_vit mel:convnext"
+_n=$(( $(echo $_combos | wc -w) * $(echo $DATASETS | wc -w) ))
+_i=0
+_summary=""
+_failed=0
+_t_all=$(date +%s)
+
+echo
+echo "############################################################"
+echo "# sweep: $_n runs over [$DATASETS]"
+echo "#   NUM_EPOCHS=$NUM_EPOCHS SEED=$SEED BATCH_SIZE=$BATCH_SIZE FIXED_SECONDS=$FIXED_SECONDS"
+echo "#   $EXTRA"
+echo "############################################################"
+
+for _ds in $DATASETS; do
+    _dd=$(_data_dir_for "$_ds")
+    _point_dataset "$_dd"
+    echo
+    echo "============================================================"
+    echo "corpus: $_dd  (Dataset2 -> Dataset/$_dd)"
+    echo "============================================================"
+
+    for _c in $_combos; do
+        _fe=${_c%%:*}
+        _md=${_c##*:}
+        _i=$((_i + 1))
+        _t0=$(date +%s)
+
+        echo
+        echo "------------------------------------------------------------"
+        echo "[$_i/$_n] $_dd | FRONTEND=$_fe MODEL=$_md"
+        echo "------------------------------------------------------------"
+
+        # set +e around the run: one failed combination must not abort the sweep.
+        set +e
+        FRONTEND=$_fe MODEL=$_md $PY "$SCRIPT"
+        _rc=$?
+        set -e
+        _mins=$(( ($(date +%s) - _t0) / 60 ))
+
+        if [ $_rc -eq 0 ]; then
+            _summary="${_summary}  ok      ${_dd} ${_fe}/${_md} (${_mins}m)\n"
+        else
+            _summary="${_summary}  FAILED  ${_dd} ${_fe}/${_md} (rc=$_rc, ${_mins}m)\n"
+            _failed=$((_failed + 1))
+            echo "[$_i/$_n] FAILED (rc=$_rc) -- continuing with the rest" >&2
+        fi
+    done
+done
+
+echo
+echo "############################################################"
+echo "# sweep done in $(( ($(date +%s) - _t_all) / 60 )) min"
+printf "$_summary"
+echo "#"
+echo "# results: results/LeafTorch_ViT/<dataset>/sweep.csv   (leaf runs)"
+echo "#          results/MelTorch_ViT/<dataset>/sweep.csv    (mel runs)"
+echo "# 4 sweep.csv files in total -- frontend x corpus. compare on test_uar"
+echo "############################################################"
+
+# Non-zero exit if anything failed, so the scheduler does not report success
+# for a sweep that only half ran.
+[ "$_failed" -eq 0 ] || exit 1
