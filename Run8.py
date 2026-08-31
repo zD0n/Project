@@ -39,7 +39,15 @@ if FRONTEND not in ("leaf", "mel"):
     raise SystemExit(f"FRONTEND={FRONTEND!r} unknown; choose 'leaf' or 'mel'")
 # Separate result dirs, or a mel run overwrites a leaf run's checkpoints and
 # appends to its sweep.csv.
-RESULT_DIR = "./results/{}Torch_ViT".format("Leaf" if FRONTEND == "leaf" else "Mel")
+#
+# RESULTS_ROOT moves the whole tree without disturbing that separation, so a
+# grid run under one banner keeps its rows out of the main results/ -- e.g.
+# RESULTS_ROOT="results/Ablation Study" writes
+# "results/Ablation Study/{Leaf,Mel}Torch_ViT/<dataset>/sweep.csv". Only the
+# root moves: frontend and dataset still get their own folder underneath.
+RESULTS_ROOT = os.environ.get("RESULTS_ROOT", "./results")
+RESULT_DIR = os.path.join(
+    RESULTS_ROOT, "{}Torch_ViT".format("Leaf" if FRONTEND == "leaf" else "Mel"))
 
 
 def _env(name, default, cast=float):
@@ -76,9 +84,26 @@ FREQ_MASK = _env("FREQ_MASK", 8, int)
 TIME_MASK = _env("TIME_MASK", 16, int)
 NORMALIZE = _env("NORMALIZE", 1, int)
 
-# vit | vit_local | cnn_vit | cnn_vit_local | convnext  (see README)
+# vit | vit_local | cnn_vit | cnn_vit_local | convnext | vit_b16  (see README)
 MODEL = os.environ.get("MODEL", "cnn_vit").lower()
 RESUME = _env("RESUME", 0, int)
+
+# Split one NUM_EPOCHS schedule across several jobs. NUM_EPOCHS stays the TOTAL
+# (e.g. 400); EPOCHS_PER_RUN caps how many this process does before saving and
+# exiting (e.g. 100, so four jobs finish the schedule).
+#
+# This is not the same as running 100 epochs four times: the cosine LR schedule
+# and the optimizer moments are defined over the full NUM_EPOCHS and restored
+# between jobs, so the result matches one uninterrupted 400-epoch run. Four
+# independent 100-epoch runs would replay warmup and the whole cosine decay
+# each time, which is a different experiment.
+EPOCHS_PER_RUN = _env("EPOCHS_PER_RUN", 0, int)   # 0 = run the whole schedule
+
+# ViT-B/16 only (MODEL=vit_b16); ignored elsewhere. This is the arm that can
+# start from ImageNet weights -- the hand-rolled ViTs in Model/ have no
+# published checkpoint at any shape, so scratch is their only option.
+VIT_PRETRAINED = _env("VIT_PRETRAINED", 0, int)
+VIT_TIMM_NAME = os.environ.get("VIT_TIMM_NAME", "vit_base_patch16_224.augreg_in21k")
 
 # ConvNeXt only (MODEL=convnext); ignored by the ViT variants.
 CONVNEXT_SIZE = os.environ.get("CONVNEXT_SIZE", "tiny").lower()
@@ -90,6 +115,9 @@ CONVNEXT_22K = _env("CONVNEXT_22K", 0, int)                # 22k instead of 1k w
 SPLIT_MODE = os.environ.get("SPLIT_MODE", "speaker")
 TEST_FRAC = _env("TEST_FRAC", 0.2)
 VAL_FRAC = _env("VAL_FRAC", 0.1)
+# <1 keeps only that fraction of the training clips. val/test are untouched, so
+# a small-data run is still scored against the same held-out speakers.
+TRAIN_FRAC = _env("TRAIN_FRAC", 1.0)
 SEED = _env("SEED", 99, int)
 DATASET = os.environ.get("DATASET", "auto").lower()
 VIT_CHANNELS = 1 + (2 if COORD_CHANNELS else 0)
@@ -226,6 +254,13 @@ else:
     n_test, n_val = int(round(len(p) * TEST_FRAC)), int(round(len(p) * VAL_FRAC))
     test_idx, val_idx, train_idx = p[:n_test], p[n_test:n_test + n_val], p[n_test + n_val:]
     held_out = "random split -- speakers appear in BOTH train and test"
+
+if TRAIN_FRAC < 1.0:
+    _full = len(train_idx)
+    keep = max(NUM_CLASSES, int(round(_full * TRAIN_FRAC)))
+    train_idx = train_idx[rng.permutation(_full)[:keep]]
+    print("\nTRAIN_FRAC={}: training on {} of {} clips".format(
+        TRAIN_FRAC, len(train_idx), _full))
 
 print("\nSplit ({}): train {} | val {} | test {}".format(
     SPLIT_MODE, len(train_idx), len(val_idx), len(test_idx)))
@@ -439,10 +474,40 @@ def build_convnext():
     return model
 
 
+def build_vit_b16():
+    """timm ViT-B/16 -- the arXiv 2502.12379 replication arm.
+
+    timm does the two pieces of surgery an ImageNet checkpoint needs here:
+    `in_chans` folds the RGB patch-embedding stem down to VIT_CHANNELS, and
+    `num_classes` drops the 21k head for a fresh NUM_CLASSES one. The same call
+    builds the scratch arm, so the two differ only in VIT_PRETRAINED and
+    nothing else can drift between them.
+
+    `img_size` is passed through rather than pinned to 224: timm interpolates
+    the position embeddings, so TARGET_SIZE=64 also works (16 tokens).
+    """
+    import timm
+
+    if TARGET_SIZE % 16:
+        raise SystemExit(f"TARGET_SIZE={TARGET_SIZE} is not a multiple of the "
+                         "16-pixel patch; use 64, 128, 224, ...")
+
+    model = timm.create_model(VIT_TIMM_NAME, pretrained=bool(VIT_PRETRAINED),
+                              num_classes=NUM_CLASSES, in_chans=VIT_CHANNELS,
+                              img_size=TARGET_SIZE, drop_rate=DROPOUT)
+    print("Model: {} ({}) | {} tokens".format(
+        VIT_TIMM_NAME,
+        "ImageNet pretrained" if VIT_PRETRAINED else "scratch",
+        (TARGET_SIZE // 16) ** 2))
+    return model
+
+
 if MODEL == "convnext":
     vit_model = build_convnext().to(device)
     print(f"Model: convnext_{CONVNEXT_SIZE} (drop_path={DROP_PATH}, "
           f"pretrained={CONVNEXT_PRETRAINED})")
+elif MODEL == "vit_b16":
+    vit_model = build_vit_b16().to(device)
 elif MODEL in _MODELS:
     _kw = dict(image_size=(TARGET_SIZE, TARGET_SIZE), patch_size=(PATCH, PATCH),
                num_classes=NUM_CLASSES, dim=DIM, depth=DEPTH, heads=HEADS,
@@ -457,11 +522,19 @@ elif MODEL in _MODELS:
     print(f"Model: {MODEL} ({_MODELS[MODEL].__name__})")
 else:
     raise SystemExit(f"MODEL={MODEL!r} unknown; "
-                     f"choose one of {sorted(list(_MODELS) + ['convnext'])}")
+                     f"choose one of {sorted(list(_MODELS) + ['convnext', 'vit_b16'])}")
 
+
+# Every arm of a grid writes into the same RESULT_DIR (one folder per frontend
+# and corpus), so training_log.csv holds several runs' epochs end to end. This
+# stamp goes on every row it writes, which is what makes them separable
+# afterwards -- without it the file is one undifferentiated block of epochs.
+RUN_TAG = "{}-{}-ts{}-p{}-e{}-s{}".format(
+    FRONTEND, MODEL, TARGET_SIZE, PATCH, NUM_EPOCHS, SEED)
 
 leaf_trainable = [p for p in leaf.parameters() if p.requires_grad]
 print(f"Frontend: {FRONTEND}")
+print(f"Run tag: {RUN_TAG}")
 print(f"Trainable params -- frontend: {sum(p.numel() for p in leaf_trainable)}, "
       f"clf: {sum(p.numel() for p in vit_model.parameters())}")
 print(f"Methods: coord={COORD_CHANNELS} specaug={SPEC_AUGMENT} norm={NORMALIZE} "
@@ -515,9 +588,44 @@ print(f"\nTraining {NUM_EPOCHS} epoch(s) | {n_train} train samples | "
       f"batch_size={BATCH_SIZE} | {num_batches} batches/epoch\n")
 
 best_path = os.path.join(RESULT_DIR, "best.pth")
+last_path = os.path.join(RESULT_DIR, "last.pth")
 train_log, best_uar = [], -1.0
+start_epoch = 0
 
-for epoch in range(NUM_EPOCHS):
+# last.pth is the resume point: unlike best.pth it holds the optimizer moments
+# and the schedule position, which is what makes a split schedule equivalent to
+# an unbroken one. best.pth stays the thing that gets tested.
+if RESUME and os.path.exists(last_path):
+    _ck = torch.load(last_path, map_location=device)
+    if _ck.get("total_epochs") != NUM_EPOCHS:
+        raise SystemExit(
+            "REFUSED to resume: {} was written for NUM_EPOCHS={}, this run says {}. "
+            "The cosine schedule would not line up -- rerun with the original "
+            "total, or delete {} to start over.".format(
+                last_path, _ck.get("total_epochs"), NUM_EPOCHS, last_path))
+    vit_model.load_state_dict(_ck["vit"])
+    leaf.load_state_dict(_ck["leaf"])
+    optimizer.load_state_dict(_ck["optimizer"])
+    scheduler.load_state_dict(_ck["scheduler"])
+    start_epoch = _ck["epoch"]
+    best_uar = _ck["best_uar"]
+    if _ck.get("numpy_rng") is not None:
+        np.random.set_state(_ck["numpy_rng"])
+    print("Resumed from {} at epoch {}/{} (best val UAR so far {:.2f}%)".format(
+        last_path, start_epoch, NUM_EPOCHS, best_uar * 100))
+elif RESUME:
+    print("RESUME=1 but no {} yet -- starting from scratch.".format(last_path))
+
+stop_epoch = NUM_EPOCHS
+if EPOCHS_PER_RUN > 0:
+    stop_epoch = min(start_epoch + EPOCHS_PER_RUN, NUM_EPOCHS)
+if start_epoch >= NUM_EPOCHS:
+    print("Schedule already complete ({} epochs).".format(NUM_EPOCHS))
+elif stop_epoch < NUM_EPOCHS:
+    print("This job runs epochs {}..{} of {}.".format(
+        start_epoch + 1, stop_epoch, NUM_EPOCHS))
+
+for epoch in range(start_epoch, stop_epoch):
     t0 = time.time()
     leaf.train()
     vit_model.train()
@@ -566,6 +674,49 @@ for epoch in range(NUM_EPOCHS):
           f"val_WA={val_wa * 100:.1f}%  val_UAR={val_uar * 100:.1f}%  "
           f"time={elapsed:.1f}s{star}")
 
+    # Written every epoch, not just on improvement: this is the resume point,
+    # so it has to reflect where training actually is, not where it was best.
+    # A job killed by the scheduler mid-chunk then loses one epoch, not all.
+    torch.save({"epoch": epoch + 1,
+                "total_epochs": NUM_EPOCHS,
+                "vit": vit_model.state_dict(),
+                "leaf": leaf.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "best_uar": best_uar,
+                "numpy_rng": np.random.get_state()}, last_path)
+
+# Keep what earlier jobs recorded: with a split schedule each job holds only
+# its own epochs, and a grid puts several models through this same file.
+#
+# Every row is stamped with the run it belongs to, so `model` and `run` are what
+# separate one arm's curve from the next. Epoch numbers cannot do it -- they
+# restart at 1 for every run in the file.
+_log_path = os.path.join(RESULT_DIR, "training_log.csv")
+_ident = {"run": RUN_TAG, "frontend": FRONTEND, "model": MODEL,
+          "dataset": DATASET, "target_size": TARGET_SIZE, "patch": PATCH,
+          "seed": SEED}
+_log_df = pd.DataFrame([{**_ident, **_r} for _r in train_log])
+# Concat rather than mode="a": a plain append writes no header, so rows written
+# before this stamp existed would silently take the new columns' places.
+# Rewriting is cheap -- the file holds one row per epoch.
+if os.path.exists(_log_path):
+    _log_df = pd.concat([pd.read_csv(_log_path), _log_df], ignore_index=True)
+_log_df.to_csv(_log_path, index=False)
+
+# A chunk that has not reached NUM_EPOCHS stops here. No test score and no
+# sweep.csv row: a partially trained model is not a result, and writing one
+# would put a number in the sweep that no completed run stands behind.
+if stop_epoch < NUM_EPOCHS:
+    print()
+    print("=" * 66)
+    print("Stopped at epoch {} of {}. Checkpoint: {}".format(
+        stop_epoch, NUM_EPOCHS, last_path))
+    print("Continue with the same settings plus RESUME=1.")
+    print("No test/sweep.csv yet -- those come when the schedule finishes.")
+    print("=" * 66)
+    raise SystemExit(0)
+
 # ---------------------------------------------------------------------------
 # Test on the best-val checkpoint
 # ---------------------------------------------------------------------------
@@ -596,7 +747,6 @@ print("\nConfusion Matrix (test):")
 print(cm_df.to_string())
 
 cm_df.to_csv(os.path.join(RESULT_DIR, "confusion_matrix.csv"))
-pd.DataFrame(train_log).to_csv(os.path.join(RESULT_DIR, "training_log.csv"), index=False)
 
 run = {"frontend": FRONTEND, "model": MODEL, "dataset": DATASET,
        "classes": NUM_CLASSES, "split_mode": SPLIT_MODE, "epochs": NUM_EPOCHS,
@@ -611,10 +761,19 @@ run = {"frontend": FRONTEND, "model": MODEL, "dataset": DATASET,
        "convnext_size": CONVNEXT_SIZE if MODEL == "convnext" else "",
        "drop_path": DROP_PATH if MODEL == "convnext" else "",
        "convnext_pretrained": CONVNEXT_PRETRAINED if MODEL == "convnext" else "",
+       "vit_pretrained": VIT_PRETRAINED if MODEL == "vit_b16" else "",
+       "train_frac": TRAIN_FRAC, "train_clips": len(train_idx),
        "fixed_seconds": FIXED_SECONDS, "seed": SEED,
        "best_val_uar": best_uar * 100, "test_wa": test_wa * 100,
        "test_uar": test_uar * 100, "train_wa": train_wa * 100}
 sweep = os.path.join(RESULT_DIR, "sweep.csv")
-pd.DataFrame([run]).to_csv(sweep, mode="a", header=not os.path.exists(sweep), index=False)
+# Merge on column names rather than appending blind: the column set grows over
+# time (vit_pretrained and train_frac are newer than the rows already on disk),
+# and a plain append would file the new values under the old header. Rewriting
+# the whole file is free -- it holds one row per run.
+row = pd.DataFrame([run])
+if os.path.exists(sweep):
+    row = pd.concat([pd.read_csv(sweep), row], ignore_index=True)
+row.to_csv(sweep, index=False)
 
 print(f"\nSaved to {RESULT_DIR}  (results appended to sweep.csv)")

@@ -8,7 +8,7 @@
 # passes DATASET in the environment, and a plain `DATASET=iemocap` here would
 # overwrite it -- silently running the wrong corpus.
 DATASET=${DATASET:-iemocap}    # iemocap | cremad
-SCRIPT=${SCRIPT:-Run7.py}      # Run5.py / Run8.py (PyTorch only) | Run6.py | Run7.py (need TF)
+SCRIPT=${SCRIPT:-Run7.py}      # Run5.py / Run8.py / Run9.py (PyTorch only) | Run6.py | Run7.py (need TF)
 EXTRA=${EXTRA:-}               # e.g. "NUM_EPOCHS=2 MODEL=convnext SEED=42"
 # =============================================================================
 #
@@ -138,6 +138,62 @@ done
 PY=python
 command -v $PY >/dev/null 2>&1 || PY=python3
 
+# ---------------------------------------------------------------------------
+# Pick the emptiest GPU.
+#
+# This node has more than one H100 and the job is not launched with --gres, so
+# every process sees all of them and torch takes cuda:0 by default. The result
+# is a queue on GPU 0 while the others idle: the 2026-08-25 run died with
+# "674 MiB free" on GPU 0 while two cards sat completely empty beside it.
+#
+# Slurm sets CUDA_VISIBLE_DEVICES itself when it really allocates a device, and
+# then the indices below would be wrong -- so by default only choose when
+# nothing has already chosen for us.
+#
+# GPU_PICK   auto (default)  pick only when CUDA_VISIBLE_DEVICES is unset
+#            force           pick regardless, overriding what was inherited
+#            off             never pick
+#
+# `force` is for this cluster's portal jobs. Asking the portal for 1 GPU is a
+# scheduling request, not device isolation: nvidia-smi inside the container
+# still lists every card, so nothing stops several jobs sharing one. If the
+# inherited CUDA_VISIBLE_DEVICES points at a card someone else has filled,
+# GPU_PICK=force moves this run to the emptiest one instead.
+#
+# The value as inherited is echoed either way, so the log says which case this
+# node is in rather than leaving it to be guessed.
+#
+# Racy by nature: two jobs starting together can pick the same card. That is
+# still better than both landing on the busiest one, which is today's default.
+# ---------------------------------------------------------------------------
+echo "CUDA_VISIBLE_DEVICES as inherited: '${CUDA_VISIBLE_DEVICES-<unset>}' (GPU_PICK=${GPU_PICK:-auto})"
+_pick=0
+case "${GPU_PICK:-auto}" in
+    force) _pick=1 ;;
+    off)   _pick=0 ;;
+    *)     [ -z "${CUDA_VISIBLE_DEVICES:-}" ] && _pick=1 ;;
+esac
+if [ "$_pick" = "1" ] && command -v nvidia-smi >/dev/null 2>&1; then
+    _gpu_table=$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits 2>/dev/null)
+    if [ -n "$_gpu_table" ]; then
+        echo "GPUs (index, free MiB):"
+        echo "$_gpu_table" | sed 's/^/  /'
+        # -t, -k2 -nr: sort by the free-memory column, descending.
+        _best=$(echo "$_gpu_table" | sort -t, -k2 -nr | head -1)
+        _best_idx=$(echo "$_best" | cut -d, -f1 | tr -d ' ')
+        _best_free=$(echo "$_best" | cut -d, -f2 | tr -d ' ')
+        if [ -n "$_best_idx" ]; then
+            export CUDA_VISIBLE_DEVICES=$_best_idx
+            echo "using GPU $_best_idx (${_best_free} MiB free)"
+            # Everything downstream sees one card, so this stays cuda:0 to torch.
+            if [ "${_best_free:-0}" -lt "${MIN_FREE_MIB:-8000}" ]; then
+                echo "warning: the emptiest GPU has only ${_best_free} MiB free." >&2
+                echo "         An OOM here is other tenants, not this config." >&2
+            fi
+        fi
+    fi
+fi
+
 # leaf_audio subclasses tf.keras layers in the Keras 2 style.
 #   TF 2.15 bundles Keras 2 -> use it as-is. Setting TF_USE_LEGACY_KERAS here
 #            makes TF look for the separate tf_keras package and fail with
@@ -193,15 +249,24 @@ case "$SCRIPT" in
     } ;;
 esac
 
-# Run8 MODEL=convnext imports timm, and the model code itself from the mounted
-# ConvNeXt/ folder. Both fail well into the run -- after the whole corpus has
-# been loaded -- so check them up front.
-if [ "$SCRIPT" = "Run8.py" ] && { [ "${MODEL:-}" = "convnext" ] || [ "$SWEEP" = "1" ]; }; then
-    [ -f ConvNeXt/models/convnext.py ] || {
-        echo "error: MODEL=convnext needs ConvNeXt/models/convnext.py under $(pwd)." >&2
-        echo "       Upload the repo's ConvNeXt/ folder alongside Run8.py." >&2
-        exit 1
-    }
+# Run8/Run9 MODEL=convnext imports timm, and the model code itself from the
+# mounted ConvNeXt/ folder; MODEL=vit_b16 needs timm alone. Both fail well into
+# the run -- after the whole corpus has been loaded, and for Run9 after folds
+# that already cost hours -- so check them up front.
+_needs_timm=0
+case "$SCRIPT" in Run8.py|Run9.py)
+    case "${MODEL:-}" in convnext|vit_b16) _needs_timm=1 ;; esac
+    [ "$SWEEP" = "1" ] && _needs_timm=1
+    ;;
+esac
+if [ "$_needs_timm" = "1" ]; then
+    if [ "${MODEL:-}" != "vit_b16" ]; then
+        [ -f ConvNeXt/models/convnext.py ] || {
+            echo "error: MODEL=convnext needs ConvNeXt/models/convnext.py under $(pwd)." >&2
+            echo "       Upload the repo's ConvNeXt/ folder alongside Run8.py." >&2
+            exit 1
+        }
+    fi
     # ConvNeXt imports two symbols timm keeps only as deprecated shims, so test
     # those rather than merely that timm is importable.
     _timm_ok() {
@@ -235,10 +300,32 @@ from timm.models.registry import register_model" 2>/dev/null
         }
     fi
     _timm_ok || {
-        echo "error: MODEL=convnext needs timm, and installing it failed." >&2
+        echo "error: MODEL=${MODEL:-convnext} needs timm, and installing it failed." >&2
         echo "       Rebuild the image from leaf_vit_h100.def, which pins timm==1.0.24." >&2
         exit 1
     }
+
+    # VIT_PRETRAINED pulls the checkpoint from the HF hub on first use. Compute
+    # nodes are often off the internet, so say so now rather than after the
+    # corpus has loaded. HF_HOME is bind-mounted, so one successful download
+    # serves every later job.
+    if [ "${MODEL:-}" = "vit_b16" ] && [ "${VIT_PRETRAINED:-0}" != "0" ]; then
+        $PY - <<'EOF' || exit 1
+import os, sys, timm
+name = os.environ.get("VIT_TIMM_NAME", "vit_base_patch16_224.augreg_in21k")
+try:
+    timm.create_model(name, pretrained=True, num_classes=2, in_chans=1)
+except Exception as e:
+    sys.stderr.write(
+        "error: could not fetch pretrained weights for {}\n"
+        "       {}: {}\n"
+        "       This node may have no internet. Download the checkpoint on a\n"
+        "       login node with the same HF_HOME, then resubmit.\n".format(
+            name, type(e).__name__, e))
+    sys.exit(1)
+print("pretrained weights for {} are cached".format(name))
+EOF
+    fi
 fi
 
 if [ "$SWEEP" != "1" ]; then

@@ -11,3 +11,5 @@ Dataset2/
 leaf-audio/
 leaf_output/
 ConvNeXt/
+paper_run/
+logs/
