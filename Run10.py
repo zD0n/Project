@@ -1,3 +1,26 @@
+# =============================================================================
+# Run10 -- the LEAF freeze/unfreeze ablation.
+#
+# Run8 with one thing added: every parameter group inside the LEAF frontend can
+# be frozen on its own. Everything else -- data, splits, classifiers, schedule,
+# sweep.csv contract -- is Run8 unchanged, so a Run10 row and a Run8 row of the
+# same configuration are comparable.
+#
+# THE QUESTION. LEAF's claim is that a frontend learned end to end beats a fixed
+# one. "Learned" is not one thing though: LEAF has four separate parameter
+# groups, and the claim is only interesting if it says which of them carry it.
+# Freezing a group leaves the op in the forward pass at its initialization, so
+# each cell isolates the value of *learning* that stage rather than the value of
+# the stage existing at all.
+#
+# The four axes are LEARN_FILTERS, LEARN_POOLING, LEARN_COMPRESSION and
+# LEARN_SMOOTHING -- see the block where they are read for what each one owns.
+# 2^4 = 16 cells; H100_Set_up/run_leaf_ablation.sh runs them.
+#
+# 1111 is full LEAF. 0000 is LEAF frozen at initialization -- a fixed Gabor
+# filterbank, which is the honest baseline for the claim and a different thing
+# from FRONTEND=mel.
+# =============================================================================
 import os
 import time
 import warnings
@@ -58,8 +81,42 @@ LEAF_N_FILTERS = _env("LEAF_N_FILTERS", 64, int)
 TARGET_SIZE = _env("TARGET_SIZE", 64, int)
 WINDOW_LEN = _env("WINDOW_LEN", 25, float)
 LEAF_LR = _env("LEAF_LR", 1e-5)
-LEARN_POOLING = _env("LEARN_POOLING", 1, int)   # 1 trains the Gaussian lowpass; 0 freezes it
-PCEN = _env("PCEN", 0, int)                     # 0 = log compression, as Run5/Run7
+# ---------------------------------------------------------------------------
+# The LEAF ablation axes
+# ---------------------------------------------------------------------------
+# Leaf.forward (leaf_pytorch/frontend.py) is four ops, three of which hold
+# parameters -- and the third holds two groups that do unrelated jobs:
+#
+#   filterbank    _complex_conv       Gabor bandpass. The parameters are each
+#                                     filter's centre frequency and bandwidth,
+#                                     i.e. where the frontend listens.
+#   squared mod   _activation         fixed, no parameters. Nothing to ablate.
+#   pooling       _pooling            Gaussian lowpass. Per-channel width and
+#                                     bias, i.e. the time-frequency tradeoff.
+#   compression   _compression        PCEN alpha/delta/root -- the shape of the
+#                                     static compression curve.
+#   smoothing     _compression.ema    PCEN's EMA coefficient, the "s" in sPCEN.
+#                                     The time constant of the gain control,
+#                                     which is a different decision from the
+#                                     curve shape above, so it gets its own
+#                                     switch rather than riding along with it.
+#
+# 1 = trains with the classifier at LEAF_LR. 0 = stays at its initialization.
+LEARN_FILTERS = _env("LEARN_FILTERS", 1, int)
+LEARN_POOLING = _env("LEARN_POOLING", 1, int)
+LEARN_COMPRESSION = _env("LEARN_COMPRESSION", 1, int)
+LEARN_SMOOTHING = _env("LEARN_SMOOTHING", 1, int)
+
+# PCEN defaults to 1 here, unlike Run8. With log compression Leaf builds no
+# _compression module at all, so the last two axes would have nothing to freeze
+# and the 16-cell factorial would quietly become 4 configurations run 4x each --
+# wasted GPU hours and an ablation table with duplicate rows.
+PCEN = _env("PCEN", 1, int)
+if not PCEN and not (LEARN_COMPRESSION and LEARN_SMOOTHING):
+    raise SystemExit(
+        "PCEN=0 removes the compression stage, so LEARN_COMPRESSION=0 or "
+        "LEARN_SMOOTHING=0 has nothing to freeze and this cell would duplicate "
+        "another. Use PCEN=1 to sweep the compression axes.")
 
 NUM_EPOCHS = _env("NUM_EPOCHS", 30, int)
 BATCH_SIZE = _env("BATCH_SIZE", 32, int)
@@ -343,9 +400,29 @@ else:
         pcen_compression=bool(PCEN),
     ).to(device)
 
+    # requires_grad_(False), not deleting the module: the stage still runs, it
+    # just stays at its initialization. Removing the op instead would confound
+    # "is learning this stage worth it" with "is this stage worth it" -- two
+    # different questions, and only the first is this ablation's.
+    _frozen = []
+    if not LEARN_FILTERS:
+        _frozen.append(("filterbank", list(leaf._complex_conv.parameters())))
     if not LEARN_POOLING:
-        for p in leaf._pooling.parameters():
+        _frozen.append(("pooling", list(leaf._pooling.parameters())))
+    if leaf._compression is not None:
+        if not LEARN_COMPRESSION:
+            # alpha/delta/root only. The EMA coefficient lives under .ema and
+            # is the smoothing axis, so it is deliberately named out here --
+            # _compression.parameters() would have swept it up too.
+            _frozen.append(("compression", [leaf._compression.alpha,
+                                            leaf._compression.delta,
+                                            leaf._compression.root]))
+        if not LEARN_SMOOTHING:
+            _frozen.append(("smoothing", list(leaf._compression.ema.parameters())))
+    for _stage, _ps in _frozen:
+        for p in _ps:
             p.requires_grad_(False)
+    print("LEAF frozen: " + (", ".join(s for s, _ in _frozen) or "nothing"))
 
 leaf_weights_path = os.path.join(RESULT_DIR, "leaf_weights.pth")
 os.makedirs(RESULT_DIR, exist_ok=True)
@@ -529,8 +606,12 @@ else:
 # and corpus), so training_log.csv holds several runs' epochs end to end. This
 # stamp goes on every row it writes, which is what makes them separable
 # afterwards -- without it the file is one undifferentiated block of epochs.
-RUN_TAG = "{}-{}-ts{}-p{}-e{}-s{}".format(
-    FRONTEND, MODEL, TARGET_SIZE, PATCH, NUM_EPOCHS, SEED)
+# The four bits are part of the identity: 16 cells share one RESULT_DIR, and
+# without them every cell's epochs would land in training_log.csv under the
+# same name. Read the suffix as leaf<filters><pooling><compression><smoothing>.
+RUN_TAG = "{}-{}-ts{}-p{}-e{}-s{}-leaf{}{}{}{}".format(
+    FRONTEND, MODEL, TARGET_SIZE, PATCH, NUM_EPOCHS, SEED,
+    LEARN_FILTERS, LEARN_POOLING, LEARN_COMPRESSION, LEARN_SMOOTHING)
 
 leaf_trainable = [p for p in leaf.parameters() if p.requires_grad]
 print(f"Frontend: {FRONTEND}")
@@ -539,6 +620,8 @@ print(f"Trainable params -- frontend: {sum(p.numel() for p in leaf_trainable)}, 
       f"clf: {sum(p.numel() for p in vit_model.parameters())}")
 print(f"Methods: coord={COORD_CHANNELS} specaug={SPEC_AUGMENT} norm={NORMALIZE} "
       f"pcen={PCEN}")
+print(f"LEAF learnable: filters={LEARN_FILTERS} pooling={LEARN_POOLING} "
+      f"compression={LEARN_COMPRESSION} smoothing={LEARN_SMOOTHING}")
 
 # One optimizer, one autograd graph -- a learnable frontend trains with the
 # classifier. mel has no parameters at all, so it contributes no group: an
@@ -603,6 +686,14 @@ if RESUME and os.path.exists(last_path):
             "The cosine schedule would not line up -- rerun with the original "
             "total, or delete {} to start over.".format(
                 last_path, _ck.get("total_epochs"), NUM_EPOCHS, last_path))
+    # 16 cells share last.pth. The total_epochs check above cannot tell them
+    # apart -- they all run the same schedule -- so without this a resumed cell
+    # would continue the previous one's weights and report them as its own.
+    if _ck.get("run_tag", RUN_TAG) != RUN_TAG:
+        raise SystemExit(
+            "REFUSED to resume: {} belongs to run {}, this run is {}. "
+            "Delete it, or give this cell its own RESULTS_ROOT.".format(
+                last_path, _ck.get("run_tag"), RUN_TAG))
     vit_model.load_state_dict(_ck["vit"])
     leaf.load_state_dict(_ck["leaf"])
     optimizer.load_state_dict(_ck["optimizer"])
@@ -679,6 +770,7 @@ for epoch in range(start_epoch, stop_epoch):
     # A job killed by the scheduler mid-chunk then loses one epoch, not all.
     torch.save({"epoch": epoch + 1,
                 "total_epochs": NUM_EPOCHS,
+                "run_tag": RUN_TAG,
                 "vit": vit_model.state_dict(),
                 "leaf": leaf.state_dict(),
                 "optimizer": optimizer.state_dict(),
@@ -746,7 +838,9 @@ cm_df.index.name = "True \\ Pred"
 print("\nConfusion Matrix (test):")
 print(cm_df.to_string())
 
-cm_df.to_csv(os.path.join(RESULT_DIR, "confusion_matrix.csv"))
+# Tagged, unlike Run8's: 16 cells share this folder and a plain name would
+# leave only the last one on disk.
+cm_df.to_csv(os.path.join(RESULT_DIR, "confusion_matrix_{}.csv".format(RUN_TAG)))
 
 run = {"frontend": FRONTEND, "model": MODEL, "dataset": DATASET,
        "classes": NUM_CLASSES, "split_mode": SPLIT_MODE, "epochs": NUM_EPOCHS,
@@ -755,7 +849,13 @@ run = {"frontend": FRONTEND, "model": MODEL, "dataset": DATASET,
        "dropout": DROPOUT, "emb_dropout": EMB_DROPOUT, "dim": DIM, "depth": DEPTH,
        "heads": HEADS, "mlp_dim": MLP_DIM, "patch": PATCH, "dim_head": DIM_HEAD,
        "cnn_channels": CNN_CHANNELS, "target_size": TARGET_SIZE,
-       "leaf_filters": LEAF_N_FILTERS, "learn_pooling": LEARN_POOLING, "pcen": PCEN,
+       "leaf_filters": LEAF_N_FILTERS, "pcen": PCEN,
+       # The ablation table itself. learn_pooling keeps Run8's name and
+       # meaning, so Run8 rows and Run10 rows line up in the same reader.
+       "run_tag": RUN_TAG,
+       "learn_filters": LEARN_FILTERS, "learn_pooling": LEARN_POOLING,
+       "learn_compression": LEARN_COMPRESSION, "learn_smoothing": LEARN_SMOOTHING,
+       "leaf_trainable_params": sum(p.numel() for p in leaf_trainable),
        "coord_channels": COORD_CHANNELS, "spec_augment": SPEC_AUGMENT,
        "freq_mask": FREQ_MASK, "time_mask": TIME_MASK, "normalize": NORMALIZE,
        "convnext_size": CONVNEXT_SIZE if MODEL == "convnext" else "",

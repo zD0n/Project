@@ -155,7 +155,7 @@ LEAF_N_FILTERS = _env("LEAF_N_FILTERS", 64, int)
 TARGET_SIZE = _env("TARGET_SIZE", 64, int)
 WINDOW_LEN = _env("WINDOW_LEN", 25, float)
 LEAF_LR = _env("LEAF_LR", 1e-5)
-LEARN_POOLING = _env("LEARN_POOLING", 0, int)   # 0 freezes the Gaussian lowpass
+LEARN_POOLING = _env("LEARN_POOLING", 1, int)   # 1 trains the Gaussian lowpass; 0 freezes it
 PCEN = _env("PCEN", 0, int)                     # 0 = log compression, as Run8
 
 NUM_EPOCHS = _env("NUM_EPOCHS", 30, int)
