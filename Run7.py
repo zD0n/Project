@@ -31,7 +31,7 @@ import functools
 
 import leaf_audio.frontend as leaf_frontend_mod
 from leaf_audio import initializers
-from Model import VitCnnGlobal, VitCnnLocal, VitGlobal, VitLocal
+from Model import VitCnnGlobal, VitCnnLocal, VitGlobal, VitLocal, VitCnnGlobalButBigger
 
 # ---------------------------------------------------------------------------
 # Config
@@ -63,7 +63,7 @@ LEAF_PREEMP = _env("LEAF_PREEMP", 1, int)        # TF LEAF supports pre-emphasis
 LEARN_POOLING = _env("LEARN_POOLING", 0, int)
 
 NUM_EPOCHS = _env("NUM_EPOCHS", 30, int)
-BATCH_SIZE = _env("BATCH_SIZE", 32, int)
+BATCH_SIZE = _env("BATCH_SIZE", 5, int)
 LR = _env("LR", 3e-4)
 WEIGHT_DECAY = _env("WEIGHT_DECAY", 0.05)
 LABEL_SMOOTHING = _env("LABEL_SMOOTHING", 0.1)
@@ -93,7 +93,8 @@ NORMALIZE = _env("NORMALIZE", 1, int)
 #   vit_local      Model/VitLocal       plain ViT, windowed local attention
 #   cnn_vit        Model/VitCnnGlobal   CNN stem + global attention  (default)
 #   cnn_vit_local  Model/VitCnnLocal    CNN stem + local attention
-MODEL = os.environ.get("MODEL", "cnn_vit").lower()
+#   cnn_vit_bigger Model/VitCnnGlobalButBigger CNN stem + global attention (larger model)
+MODEL = os.environ.get("MODEL", "cnn_vit_bigger").lower()
 
 RESUME = _env("RESUME", 0, int)
 
@@ -365,7 +366,7 @@ def leaf_forward(waveforms, training):
 # ---------------------------------------------------------------------------
 # Model: CNN-stem ViT
 # ---------------------------------------------------------------------------
-_MODELS = {"vit": VitGlobal, "vit_local": VitLocal,
+_MODELS = {"vit": VitGlobal, "vit_local": VitLocal, "cnn_vit_bigger": VitCnnGlobalButBigger,
            "cnn_vit": VitCnnGlobal, "cnn_vit_local": VitCnnLocal}
 if MODEL not in _MODELS:
     raise SystemExit(f"MODEL={MODEL!r} unknown; choose one of {sorted(_MODELS)}")
