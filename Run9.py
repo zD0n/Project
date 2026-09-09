@@ -1,103 +1,3 @@
-"""Run9 -- single-stream audio, scored by leave-one-session-out 5-fold CV.
-
-Takes from
-
-    Wen Wu, Chao Zhang, Philip C. Woodland,
-    "Emotion recognition by fusing time synchronous and time asynchronous
-     representations", ICASSP 2021.  arXiv:2010.14102
-
-the two pieces that do not depend on text:
-
-  * MULTI-HEAD SELF-ATTENTIVE POOLING, in place of reading the ViT's CLS
-    token. The paper pools its frame sequence with a five-head attentive layer
-    -- three heads on a spiky distribution, two on a smooth one -- so each head
-    can weight a different part of the utterance. `POOL=attn` does that over
-    the ViT's patch tokens; `POOL=cls` is the Run8 behaviour and the control it
-    is measured against.
-
-    One difference worth stating: the paper pools a 1-D sequence of time
-    frames, while the ViT's tokens are a 2-D grid of (time, frequency) patches
-    -- at TARGET_SIZE=64 and PATCH=8 that is 8x8 = 64 tokens, not 8 time steps.
-    So the attention weights time and frequency jointly rather than time alone.
-    That is a consequence of pooling a ViT instead of a TDNN, not a knob.
-
-  * THE EVALUATION PROTOCOL. The paper reports leave-one-session-out 5-fold CV
-    (8 speakers training, 2 testing per fold), not a single split. Run5..Run8
-    all report one split, so their numbers carry no error bar; a Run9 row is a
-    mean +- std over five folds.
-
-Its large-margin softmax is available too, as `LOSS=amsoftmax`.
-
-The paper's actual contribution -- fusing a time-synchronous audio+text branch
-with a time-asynchronous cross-utterance one -- is NOT reproduced here. Both of
-its branches are text-driven and this is an audio-only pipeline, so what is
-left is one stream:
-
-    waveform -> LEAF/mel -> (+coord planes) -> ViT -> pool -> FC -> softmax
-
-Everything before the pooling is Run8's, unchanged, so `POOL=cls LOSS=ce` is a
-Run8 model measured on the new protocol and the pooling comparison is
-controlled.
-
-CREMA-D has no sessions -- 91 independent actors -- so its 5 folds are
-actor-disjoint groups instead. Different corpus structure, same guarantee: no
-speaker appears in both train and test.
-
-Class sets (IEMOCAP_CLASSES):
-    4        the paper's 4-way: neutral, sad, anger, happy (excited merged in)
-    5        Run8's 5-way: excited kept separate, for comparing against Run8
-    5others  the paper's 5-way: 4-way plus an "others" class (frustration,
-             surprise, fear, disgust, other)
-
-Absolute numbers will not land on the paper's 77.57/78.41 -- that system had
-text and this one does not, and they report 5531 utterances for 4-way against
-6896 here, so the agreement filter differs too. Read Run9's arms against each
-other on the same folds, which is controlled.
-
-Environment variables: everything Run8 accepts, plus
-
-    POOL             attn  attn | cls   temporal pooling of the ViT tokens
-    ATT_HEADS        5     self-attentive heads (paper: 5)
-    ATT_SHARP        3     of those, how many start on the spiky temperature
-    ATT_HIDDEN       64    bottleneck width inside the attention
-    EMBED_DIM        256   width of the pooled embedding before the classifier
-    IEMOCAP_CLASSES  4     4 | 5 | 5others
-    LOSS             ce    ce | amsoftmax  (the paper's large-margin family)
-    AM_MARGIN        0.2
-    AM_SCALE         30
-    CV_FOLDS         5
-    VAL_FRAC         0.125 share of TRAINING speakers held out for val
-    FOLD             -1    -1 runs every fold; 0..4 runs one, for job splitting
-    RESUME_FOLD      1     0 restarts an interrupted fold instead of resuming
-
-MODEL accepts the four hand-rolled ViTs and `convnext`. For ConvNeXt, POOL=cls
-is its own global average pool (Run8's model) and POOL=attn pools the final
-(N,C,H,W) stage map instead -- that map IS the token grid, just spelled
-differently. Its ConvNeXt knobs are Run8's, unchanged:
-
-    CONVNEXT_SIZE        tiny   tiny small base large xlarge
-    DROP_PATH            0.1    stochastic depth
-    HEAD_INIT_SCALE      1.0
-    CONVNEXT_PRETRAINED  0      1 downloads ImageNet weights
-    CONVNEXT_22K         0      with the above, 22k instead of 1k
-
-Mind the grid size with POOL=attn: ConvNeXt downsamples by 32, so TARGET_SIZE=64
-leaves a 2x2 map -- four tokens for five heads, too few for the attention to say
-anything the average does not. Use TARGET_SIZE=128 (4x4) or 224 (7x7). Run9
-prints a warning when the count is low rather than letting it pass silently.
-
-Folds are the unit of restart. Each finished fold appends a row to folds.csv;
-rerunning skips folds already recorded, so a job killed after fold 2 resumes at
-fold 3. The aggregate sweep.csv row is written only once all folds are in.
-
-Within a fold, an epoch is the unit of restart. Every epoch overwrites
-last_<tag>_fold<k>.pth with the model, frontend, optimizer, scheduler and RNG
-state, and a fold that is killed part-way picks up from the next epoch on the
-following run rather than starting over -- which matters when the job's wall
-clock is shorter than a fold. The file is deleted once the fold reaches
-folds.csv. RESUME_FOLD=0 disables it.
-"""
-
 import hashlib
 import json
 import os
@@ -114,7 +14,7 @@ import torch.nn.functional as F
 from torch import nn, optim
 
 from leaf_pytorch.frontend import Leaf
-from Model import VitCnnGlobal, VitCnnLocal, VitGlobal, VitLocal
+from Model import VitCnnGlobal, VitCnnLocal, VitGlobal, VitLocal, VitCnnGlobalButBigger
 
 # ---------------------------------------------------------------------------
 # Config
@@ -131,40 +31,42 @@ LABEL_ALIASES = {
 DATASET_DIR = os.environ.get("DATASET_DIR", "Dataset2")
 SAMPLE_RATE = 16000
 
+# ---------------------------------------------------------------------------
+
 FRONTEND = os.environ.get("FRONTEND", "leaf").lower()
+
+# ---------------------------------------------------------------------------
+
 if FRONTEND not in ("leaf", "mel"):
     raise SystemExit(f"FRONTEND={FRONTEND!r} unknown; choose 'leaf' or 'mel'")
-# Separate from Run8's results/{Leaf,Mel}Torch_ViT: these rows are 5-fold CV
-# means, not single-split scores, and mixing the two in one sweep.csv would put
-# incomparable numbers in the same column.
-# RESULTS_ROOT moves the whole tree without disturbing the frontend and
-# dataset folders underneath, so a grid run under one banner keeps its rows
-# out of the main results/ -- e.g. RESULTS_ROOT="results/Ablation Study"
-# writes "results/Ablation Study/{Leaf,Mel}Torch_CV/<dataset>/". Same
-# variable and same meaning as in Run8.
+
 RESULTS_ROOT = os.environ.get("RESULTS_ROOT", "./results")
 RESULT_DIR = os.path.join(
-    RESULTS_ROOT, "{}Torch_CV".format("Leaf" if FRONTEND == "leaf" else "Mel"))
+    RESULTS_ROOT, "{}Torch_CV".format("Leaf" if FRONTEND == "leaf" else "Mel")
+)
 
 
 def _env(name, default, cast=float):
     return cast(os.environ.get(name, str(default)))
 
 
+# LEAF Param
 LEAF_N_FILTERS = _env("LEAF_N_FILTERS", 64, int)
 TARGET_SIZE = _env("TARGET_SIZE", 64, int)
 WINDOW_LEN = _env("WINDOW_LEN", 25, float)
-LEAF_LR = _env("LEAF_LR", 1e-5)
-LEARN_POOLING = _env("LEARN_POOLING", 1, int)   # 1 trains the Gaussian lowpass; 0 freezes it
-PCEN = _env("PCEN", 0, int)                     # 0 = log compression, as Run8
+LEAF_LR = _env("LEAF_LR", 1e-4)
+LEARN_POOLING = _env("LEARN_POOLING", 0, int)
+PCEN = _env("PCEN", 1, int)
 
-NUM_EPOCHS = _env("NUM_EPOCHS", 30, int)
-BATCH_SIZE = _env("BATCH_SIZE", 32, int)
+
+NUM_EPOCHS = _env("NUM_EPOCHS", 15, int)
+BATCH_SIZE = _env("BATCH_SIZE", 5, int)
 LR = _env("LR", 3e-4)
 WEIGHT_DECAY = _env("WEIGHT_DECAY", 0.05)
 LABEL_SMOOTHING = _env("LABEL_SMOOTHING", 0.1)
 WARMUP_EPOCHS = _env("WARMUP_EPOCHS", 5, int)
 
+# Model Param
 DIM = _env("DIM", 256, int)
 DEPTH = _env("DEPTH", 6, int)
 HEADS = _env("HEADS", 8, int)
@@ -175,21 +77,25 @@ CNN_CHANNELS = _env("CNN_CHANNELS", 64, int)
 DROPOUT = _env("DROPOUT", 0.2)
 EMB_DROPOUT = _env("EMB_DROPOUT", 0.1)
 
+# Dataset Param
 COORD_CHANNELS = _env("COORD_CHANNELS", 1, int)
 SPEC_AUGMENT = _env("SPEC_AUGMENT", 1, int)
 FREQ_MASK = _env("FREQ_MASK", 8, int)
 TIME_MASK = _env("TIME_MASK", 16, int)
 NORMALIZE = _env("NORMALIZE", 1, int)
 
-MODEL = os.environ.get("MODEL", "cnn_vit").lower()
+# ---------------------------------------------------------------------------
+
+MODEL = os.environ.get("MODEL", "cnn_vit_bigger").lower()
+
+# ---------------------------------------------------------------------------
 
 # ConvNeXt only (MODEL=convnext); ignored by the ViT variants. Same names and
-# defaults as Run8, so a config carries over between the two scripts.
 CONVNEXT_SIZE = os.environ.get("CONVNEXT_SIZE", "tiny").lower()
-DROP_PATH = _env("DROP_PATH", 0.1)          # stochastic depth, ConvNeXt-T default
+DROP_PATH = _env("DROP_PATH", 0.1)  # stochastic depth, ConvNeXt-T default
 HEAD_INIT_SCALE = _env("HEAD_INIT_SCALE", 1.0)
 CONVNEXT_PRETRAINED = _env("CONVNEXT_PRETRAINED", 0, int)  # downloads ImageNet weights
-CONVNEXT_22K = _env("CONVNEXT_22K", 0, int)                # 22k instead of 1k weights
+CONVNEXT_22K = _env("CONVNEXT_22K", 0, int)  # 22k instead of 1k weights
 
 # --- what Run9 adds --------------------------------------------------------
 POOL = os.environ.get("POOL", "attn").lower()
@@ -202,10 +108,11 @@ LOSS = os.environ.get("LOSS", "ce").lower()
 AM_MARGIN = _env("AM_MARGIN", 0.2)
 AM_SCALE = _env("AM_SCALE", 30.0)
 CV_FOLDS = _env("CV_FOLDS", 5, int)
-VAL_FRAC = _env("VAL_FRAC", 0.125)   # of the TRAINING speakers, per fold
+VAL_FRAC = _env("VAL_FRAC", 0.125)  # of the TRAINING speakers, per fold
 FOLD = _env("FOLD", -1, int)
 # 1 = pick a killed fold back up where it stopped; 0 = always start it over.
 RESUME_FOLD = _env("RESUME_FOLD", 1, int)
+LOAD_MODEL = os.environ.get("LOAD_MODEL", "")
 
 SEED = _env("SEED", 99, int)
 DATASET = os.environ.get("DATASET", "auto").lower()
@@ -263,8 +170,9 @@ IEMOCAP_SETS = {
 
 if DATASET == "iemocap":
     if IEMOCAP_CLASSES not in IEMOCAP_SETS:
-        raise SystemExit("IEMOCAP_CLASSES={!r}; choose 4, 5 or 5others".format(
-            IEMOCAP_CLASSES))
+        raise SystemExit(
+            "IEMOCAP_CLASSES={!r}; choose 4, 5 or 5others".format(IEMOCAP_CLASSES)
+        )
     EMOTION_MAP, OTHERS_CLASS = IEMOCAP_SETS[IEMOCAP_CLASSES]
 else:
     EMOTION_MAP, OTHERS_CLASS = CREMAD_MAP, None
@@ -303,8 +211,11 @@ def session_of(fname):
 
 
 audio_dir = next(
-    (os.path.join(DATASET_DIR, d) for d in ("audios", "AudioWAV")
-     if os.path.isdir(os.path.join(DATASET_DIR, d))),
+    (
+        os.path.join(DATASET_DIR, d)
+        for d in ("audios", "AudioWAV")
+        if os.path.isdir(os.path.join(DATASET_DIR, d))
+    ),
     DATASET_DIR,
 )
 all_wavs = sorted(f for f in os.listdir(audio_dir) if f.lower().endswith(".wav"))
@@ -329,12 +240,18 @@ all_labels = np.array(all_labels, dtype=np.int64)
 print(f"Dataset: {DATASET} | {NUM_CLASSES} classes: {', '.join(CLASS_NAMES)}")
 print(f"Usable clips: {len(audio_files)} of {len(all_wavs)}")
 if skipped:
-    print("  skipped labels: " + ", ".join(f"{k}={v}" for k, v in sorted(skipped.items())))
+    print(
+        "  skipped labels: " + ", ".join(f"{k}={v}" for k, v in sorted(skipped.items()))
+    )
 if not audio_files:
     raise SystemExit("No clips matched the class set -- check DATASET / labels.csv")
-print("  per class: " + ", ".join(
-    f"{n}={c}" for n, c in zip(CLASS_NAMES,
-                               np.bincount(all_labels, minlength=NUM_CLASSES))))
+print(
+    "  per class: "
+    + ", ".join(
+        f"{n}={c}"
+        for n, c in zip(CLASS_NAMES, np.bincount(all_labels, minlength=NUM_CLASSES))
+    )
+)
 
 # ---------------------------------------------------------------------------
 # Audio
@@ -351,8 +268,10 @@ for fname in audio_files:
     all_audio.append(audio)
 
 lengths = np.array([a.shape[0] for a in all_audio])
-print(f"Loaded {len(all_audio)} files | max length: {lengths.max()} samples | "
-      f"total {lengths.sum() / SAMPLE_RATE:.1f}s")
+print(
+    f"Loaded {len(all_audio)} files | max length: {lengths.max()} samples | "
+    f"total {lengths.sum() / SAMPLE_RATE:.1f}s"
+)
 
 # One fixed input length for every batch: variable shapes make the CUDA
 # allocator grow without bound and epochs get slower and slower.
@@ -361,8 +280,11 @@ if FIXED_SECONDS <= 0:
     FIXED_SECONDS = min(6.0, max(2.0, float(np.percentile(lengths, 75)) / SAMPLE_RATE))
 FIXED_SAMPLES = int(round(FIXED_SECONDS * SAMPLE_RATE))
 _trunc = int((lengths > FIXED_SAMPLES).sum())
-print(f"Fixed input window: {FIXED_SECONDS:.2f}s ({FIXED_SAMPLES} samples) | "
-      f"{_trunc} of {len(lengths)} clips cropped ({_trunc / len(lengths) * 100:.1f}%)")
+print(
+    f"Fixed input window: {FIXED_SECONDS:.2f}s ({FIXED_SAMPLES} samples) | "
+    f"{_trunc} of {len(lengths)} clips cropped ({_trunc / len(lengths) * 100:.1f}%)"
+)
+
 
 # ---------------------------------------------------------------------------
 # Batching and features -- identical to Run8, so POOL=cls reproduces its model
@@ -380,7 +302,7 @@ def make_batch(indices, train=False):
         n = x.shape[0]
         if n > FIXED_SAMPLES:
             off = np.random.randint(0, n - FIXED_SAMPLES + 1) if train else 0
-            batch[j] = x[off:off + FIXED_SAMPLES]
+            batch[j] = x[off : off + FIXED_SAMPLES]
         else:
             batch[j, :n] = x
     return batch
@@ -407,11 +329,11 @@ def spec_augment(x):
         t = int(np.random.randint(0, TIME_MASK + 1))
         if t > 0 and h > t:
             t0 = int(np.random.randint(0, h - t))
-            mask[i, :, t0:t0 + t, :] = 0.0
+            mask[i, :, t0 : t0 + t, :] = 0.0
         f = int(np.random.randint(0, FREQ_MASK + 1))
         if f > 0 and w > f:
             f0 = int(np.random.randint(0, w - f))
-            mask[i, :, :, f0:f0 + f] = 0.0
+            mask[i, :, :, f0 : f0 + f] = 0.0
     return x * mask
 
 
@@ -423,12 +345,13 @@ def features(indices, train):
     """
     wav = make_batch(indices, train=train)
     x = torch.from_numpy(wav).to(device, non_blocking=True).unsqueeze(1)
-    feats = frontend(x)                                # (B, n_filters, frames)
+    feats = frontend(x)  # (B, n_filters, frames)
     if FRONTEND == "mel" or not PCEN:
         feats = torch.log(feats + 1e-5)
-    feats = feats.transpose(1, 2).unsqueeze(1)         # (B, 1, frames, filters)
-    feats = F.interpolate(feats, size=(TARGET_SIZE, TARGET_SIZE),
-                          mode="bilinear", align_corners=False)
+    feats = feats.transpose(1, 2).unsqueeze(1)  # (B, 1, frames, filters)
+    feats = F.interpolate(
+        feats, size=(TARGET_SIZE, TARGET_SIZE), mode="bilinear", align_corners=False
+    )
     if NORMALIZE:
         mean = feats.mean(dim=(-2, -1), keepdim=True)
         std = feats.std(dim=(-2, -1), keepdim=True)
@@ -437,29 +360,35 @@ def features(indices, train):
         feats = spec_augment(feats)
     if COORD_CHANNELS:
         feats = torch.cat(
-            [feats, coord_planes(feats.shape[0], TARGET_SIZE, TARGET_SIZE)], dim=1)
+            [feats, coord_planes(feats.shape[0], TARGET_SIZE, TARGET_SIZE)], dim=1
+        )
     return feats
 
 
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
-_MODELS = {"vit": VitGlobal, "vit_local": VitLocal,
-           "cnn_vit": VitCnnGlobal, "cnn_vit_local": VitCnnLocal}
+_MODELS = {
+    "vit": VitGlobal,
+    "vit_local": VitLocal,
+    "cnn_vit_bigger": VitCnnGlobalButBigger,
+    "cnn_vit": VitCnnGlobal,
+    "cnn_vit_local": VitCnnLocal,
+}
 
 _CONVNEXT_SIZES = {
-    "tiny":   dict(depths=[3, 3, 9, 3],  dims=[96, 192, 384, 768]),
-    "small":  dict(depths=[3, 3, 27, 3], dims=[96, 192, 384, 768]),
-    "base":   dict(depths=[3, 3, 27, 3], dims=[128, 256, 512, 1024]),
-    "large":  dict(depths=[3, 3, 27, 3], dims=[192, 384, 768, 1536]),
+    "tiny": dict(depths=[3, 3, 9, 3], dims=[96, 192, 384, 768]),
+    "small": dict(depths=[3, 3, 27, 3], dims=[96, 192, 384, 768]),
+    "base": dict(depths=[3, 3, 27, 3], dims=[128, 256, 512, 1024]),
+    "large": dict(depths=[3, 3, 27, 3], dims=[192, 384, 768, 1536]),
     "xlarge": dict(depths=[3, 3, 27, 3], dims=[256, 512, 1024, 2048]),
 }
 
 if MODEL not in _MODELS and MODEL != "convnext":
     raise SystemExit(
         "MODEL={!r} is not available in Run9; choose one of {}.\n"
-        "vit_b16 stays in Run8.".format(
-            MODEL, sorted(list(_MODELS) + ["convnext"])))
+        "vit_b16 stays in Run8.".format(MODEL, sorted(list(_MODELS) + ["convnext"]))
+    )
 
 
 class SelfAttentivePooling(nn.Module):
@@ -477,13 +406,13 @@ class SelfAttentivePooling(nn.Module):
         super().__init__()
         self.w1 = nn.Linear(dim, hidden)
         self.w2 = nn.Linear(hidden, heads)
-        t = torch.full((heads,), 2.0)                # smooth
-        t[:max(0, min(sharp, heads))] = 0.5          # spiky heads first
+        t = torch.full((heads,), 2.0)  # smooth
+        t[: max(0, min(sharp, heads))] = 0.5  # spiky heads first
         self.log_temp = nn.Parameter(t.log())
         self.out_dim = dim * heads
 
-    def forward(self, h):                            # h: (B, tokens, dim)
-        e = self.w2(torch.tanh(self.w1(h)))          # (B, tokens, heads)
+    def forward(self, h):  # h: (B, tokens, dim)
+        e = self.w2(torch.tanh(self.w1(h)))  # (B, tokens, heads)
         e = e / self.log_temp.exp().clamp(min=1e-2)
         a = torch.softmax(e, dim=1)
         return torch.einsum("bth,btd->bhd", a, h).flatten(1)
@@ -496,6 +425,7 @@ class SelfAttentivePooling(nn.Module):
 #   forward_pooled()  the backbone's OWN pooling -- what POOL=cls uses, and
 #                     what keeps POOL=cls identical to the Run8 model
 #   forward_tokens()  the pre-pooling sequence, for POOL=attn
+
 
 class ViTBackbone(nn.Module):
     """One of the four hand-rolled ViTs in Model/, built exactly as Run8 builds
@@ -515,10 +445,11 @@ class ViTBackbone(nn.Module):
         self.tokens = (TARGET_SIZE // PATCH) ** 2
         self._tok = None
         net.transformer.register_forward_hook(
-            lambda _m, _i, out: setattr(self, "_tok", out))
+            lambda _m, _i, out: setattr(self, "_tok", out)
+        )
 
     def forward_pooled(self, x):
-        return self.net(x)                   # CLS token; head is Identity
+        return self.net(x)  # CLS token; head is Identity
 
     def forward_tokens(self, x):
         self.net(x)
@@ -552,14 +483,14 @@ class ConvNeXtBackbone(nn.Module):
         for i in range(4):
             x = self.net.downsample_layers[i](x)
             x = self.net.stages[i](x)
-        return x                             # (B, C, H, W)
+        return x  # (B, C, H, W)
 
     def forward_pooled(self, x):
         # Identical to the vendored forward_features: norm(GAP(map)).
         return self.net.norm(self._grid(x).mean([-2, -1]))
 
     def forward_tokens(self, x):
-        t = self._grid(x).flatten(2).transpose(1, 2)   # (B, H*W, C)
+        t = self._grid(x).flatten(2).transpose(1, 2)  # (B, H*W, C)
         # Norm per token, then pool -- the reverse of forward_pooled, which
         # pools then norms. Deliberate: the attention scores tokens against
         # each other, so they have to be on a common scale first, and it
@@ -577,15 +508,17 @@ class Run9Net(nn.Module):
         self.backbone = backbone
 
         if POOL == "attn":
-            self.pool = SelfAttentivePooling(backbone.dim, ATT_HEADS,
-                                             ATT_HIDDEN, ATT_SHARP)
+            self.pool = SelfAttentivePooling(
+                backbone.dim, ATT_HEADS, ATT_HIDDEN, ATT_SHARP
+            )
             emb_in = self.pool.out_dim
         else:
             self.pool = None
             emb_in = backbone.dim
 
-        self.embed = nn.Sequential(nn.Linear(emb_in, EMBED_DIM), nn.ReLU(),
-                                   nn.Dropout(DROPOUT))
+        self.embed = nn.Sequential(
+            nn.Linear(emb_in, EMBED_DIM), nn.ReLU(), nn.Dropout(DROPOUT)
+        )
         if LOSS == "amsoftmax":
             # AM-Softmax needs unit-norm weights and inputs; the scale and
             # margin are applied in the loss, not here.
@@ -613,24 +546,36 @@ def build_convnext():
     from ConvNeXt.models.convnext import ConvNeXt, model_urls
 
     if CONVNEXT_SIZE not in _CONVNEXT_SIZES:
-        raise SystemExit("CONVNEXT_SIZE={!r} unknown; choose one of {}".format(
-            CONVNEXT_SIZE, sorted(_CONVNEXT_SIZES)))
+        raise SystemExit(
+            "CONVNEXT_SIZE={!r} unknown; choose one of {}".format(
+                CONVNEXT_SIZE, sorted(_CONVNEXT_SIZES)
+            )
+        )
     if TARGET_SIZE < 32:
-        raise SystemExit("TARGET_SIZE={} is too small for ConvNeXt "
-                         "(4 stages downsample by 32x; use >= 32)".format(TARGET_SIZE))
+        raise SystemExit(
+            "TARGET_SIZE={} is too small for ConvNeXt "
+            "(4 stages downsample by 32x; use >= 32)".format(TARGET_SIZE)
+        )
 
     # num_classes only sizes a head we replace; keep it valid anyway.
-    model = ConvNeXt(in_chans=VIT_CHANNELS, num_classes=NUM_CLASSES,
-                     drop_path_rate=DROP_PATH, head_init_scale=HEAD_INIT_SCALE,
-                     **_CONVNEXT_SIZES[CONVNEXT_SIZE])
+    model = ConvNeXt(
+        in_chans=VIT_CHANNELS,
+        num_classes=NUM_CLASSES,
+        drop_path_rate=DROP_PATH,
+        head_init_scale=HEAD_INIT_SCALE,
+        **_CONVNEXT_SIZES[CONVNEXT_SIZE],
+    )
 
     if CONVNEXT_PRETRAINED:
         key = "convnext_{}_{}".format(CONVNEXT_SIZE, "22k" if CONVNEXT_22K else "1k")
         if key not in model_urls:
-            raise SystemExit("No published weights for {} "
-                             "(xlarge is 22k-only; set CONVNEXT_22K=1)".format(key))
-        state = torch.hub.load_state_dict_from_url(
-            model_urls[key], map_location="cpu")["model"]
+            raise SystemExit(
+                "No published weights for {} "
+                "(xlarge is 22k-only; set CONVNEXT_22K=1)".format(key)
+            )
+        state = torch.hub.load_state_dict_from_url(model_urls[key], map_location="cpu")[
+            "model"
+        ]
         # Two mismatches against an ImageNet checkpoint: a 1000/21841-way head,
         # and an RGB stem when VIT_CHANNELS is 1 or 3+coords.
         state = {k: v for k, v in state.items() if not k.startswith("head.")}
@@ -638,12 +583,16 @@ def build_convnext():
         if state[stem].shape[1] != VIT_CHANNELS:
             # Collapse RGB to one filter, then spread it over the real channel
             # count so the summed stem response keeps its original scale.
-            state[stem] = (state[stem].mean(dim=1, keepdim=True)
-                           .repeat(1, VIT_CHANNELS, 1, 1) * (3.0 / VIT_CHANNELS))
+            state[stem] = state[stem].mean(dim=1, keepdim=True).repeat(
+                1, VIT_CHANNELS, 1, 1
+            ) * (3.0 / VIT_CHANNELS)
         missing, unexpected = model.load_state_dict(state, strict=False)
-        print("Loaded {}: {} missing, {} unexpected "
-              "(the head is expected to be missing)".format(
-                  key, len(missing), len(unexpected)))
+        print(
+            "Loaded {}: {} missing, {} unexpected "
+            "(the head is expected to be missing)".format(
+                key, len(missing), len(unexpected)
+            )
+        )
     return model
 
 
@@ -651,11 +600,19 @@ def build_model():
     if MODEL == "convnext":
         backbone = ConvNeXtBackbone(build_convnext())
     else:
-        kw = dict(image_size=(TARGET_SIZE, TARGET_SIZE), patch_size=(PATCH, PATCH),
-                  num_classes=DIM,  # replaced by Identity; only the shape matters
-                  dim=DIM, depth=DEPTH, heads=HEADS, mlp_dim=MLP_DIM,
-                  channels=VIT_CHANNELS, pool="cls", dropout=DROPOUT,
-                  emb_dropout=EMB_DROPOUT)
+        kw = dict(
+            image_size=(TARGET_SIZE, TARGET_SIZE),
+            patch_size=(PATCH, PATCH),
+            num_classes=DIM,  # replaced by Identity; only the shape matters
+            dim=DIM,
+            depth=DEPTH,
+            heads=HEADS,
+            mlp_dim=MLP_DIM,
+            channels=VIT_CHANNELS,
+            pool="cls",
+            dropout=DROPOUT,
+            emb_dropout=EMB_DROPOUT,
+        )
         if MODEL.startswith("cnn_"):
             kw["cnn_channels"] = CNN_CHANNELS
         if MODEL != "cnn_vit_local":
@@ -664,13 +621,47 @@ def build_model():
     return Run9Net(backbone, NUM_CLASSES).to(device)
 
 
+def load_trained_model(model, path, frontend=None):
+
+    if not path or not os.path.exists(path):
+        print(f"  LOAD_MODEL not found: {path!r}")
+        return
+    temp = torch.load(path, map_location=device, weights_only=False)
+    if isinstance(temp, dict) and "model" in temp:
+        state = temp["model"]
+    elif isinstance(temp, dict) and all(
+        isinstance(v, torch.Tensor) for v in temp.values()
+    ):
+        state = temp
+    elif isinstance(temp, dict) and "vit" in temp:
+        state = temp["vit"]
+    else:
+        state = temp
+
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if len(missing) > 0 and len(unexpected) == 0:
+        prefixed = {"backbone.net." + k: v for k, v in state.items()}
+        missing, unexpected = model.load_state_dict(prefixed, strict=False)
+    loaded = len(state) - len(missing) - len(unexpected)
+    print(
+        "  Loaded pretrained model from {}: {} params loaded, "
+        "{} missing, {} unexpected".format(
+            os.path.basename(path), loaded, len(missing), len(unexpected)
+        )
+    )
+    if frontend is not None and isinstance(temp, dict) and "frontend" in temp:
+        frontend.load_state_dict(temp["frontend"])
+        print("  Loaded frontend state.")
+
+
 def build_frontend():
     if FRONTEND == "mel":
         import torchaudio
+
         # LEAF convolves over a 25 ms window and pools to a 10 ms hop; match
         # both so the two frontends emit the same number of frames.
         win = int(round(SAMPLE_RATE * WINDOW_LEN / 1000.0))
-        n_fft = 1 << (win - 1).bit_length()          # next power of two >= win
+        n_fft = 1 << (win - 1).bit_length()  # next power of two >= win
 
         class MelFrontend(nn.Module):
             """Fixed log-mel filterbank with the same contract as Leaf:
@@ -682,9 +673,15 @@ def build_frontend():
             def __init__(self):
                 super().__init__()
                 self.mel = torchaudio.transforms.MelSpectrogram(
-                    sample_rate=SAMPLE_RATE, n_fft=n_fft, win_length=win,
+                    sample_rate=SAMPLE_RATE,
+                    n_fft=n_fft,
+                    win_length=win,
                     hop_length=int(round(SAMPLE_RATE * 10.0 / 1000.0)),
-                    n_mels=LEAF_N_FILTERS, f_min=60.0, f_max=7800.0, power=2.0)
+                    n_mels=LEAF_N_FILTERS,
+                    f_min=60.0,
+                    f_max=7800.0,
+                    power=2.0,
+                )
 
             def forward(self, x):
                 # 1e-6 keeps the log downstream finite on digital silence.
@@ -692,9 +689,15 @@ def build_frontend():
 
         return MelFrontend().to(device)
 
-    fe = Leaf(n_filters=LEAF_N_FILTERS, sample_rate=SAMPLE_RATE,
-              window_len=WINDOW_LEN, preemp=False, init_min_freq=60.0,
-              init_max_freq=7800.0, pcen_compression=bool(PCEN)).to(device)
+    fe = Leaf(
+        n_filters=LEAF_N_FILTERS,
+        sample_rate=SAMPLE_RATE,
+        window_len=WINDOW_LEN,
+        preemp=False,
+        init_min_freq=60.0,
+        init_max_freq=7800.0,
+        pcen_compression=bool(PCEN),
+    ).to(device)
     if not LEARN_POOLING:
         for p in fe._pooling.parameters():
             p.requires_grad_(False)
@@ -704,8 +707,9 @@ def build_frontend():
 def am_softmax_loss(cos, target):
     """Additive-margin softmax -- the large-margin family the paper uses."""
     m = torch.zeros_like(cos).scatter_(1, target.view(-1, 1), AM_MARGIN)
-    return F.cross_entropy(AM_SCALE * (cos - m), target,
-                           label_smoothing=LABEL_SMOOTHING)
+    return F.cross_entropy(
+        AM_SCALE * (cos - m), target, label_smoothing=LABEL_SMOOTHING
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -750,21 +754,40 @@ def make_folds():
         n_val = min(len(rest_spk) - 1, max(1, int(round(len(rest_spk) * VAL_FRAC))))
         val_spk = np.random.RandomState(SEED + k).permutation(rest_spk)[:n_val]
         in_val = np.isin(speakers[rest], val_spk)
-        folds.append(dict(name=names[k], train=rest[~in_val], val=rest[in_val],
-                          test=test_idx, val_speakers=len(val_spk),
-                          val_speaker=",".join(map(str, sorted(val_spk)))))
+        folds.append(
+            dict(
+                name=names[k],
+                train=rest[~in_val],
+                val=rest[in_val],
+                test=test_idx,
+                val_speakers=len(val_spk),
+                val_speaker=",".join(map(str, sorted(val_spk))),
+            )
+        )
     return folds
 
 
 folds = make_folds()
-print("\nCV: {} folds ({})".format(
-    len(folds), "leave-one-session-out" if DATASET == "iemocap"
-    else "actor-disjoint groups"))
+print(
+    "\nCV: {} folds ({})".format(
+        len(folds),
+        "leave-one-session-out" if DATASET == "iemocap" else "actor-disjoint groups",
+    )
+)
 for k, f in enumerate(folds):
     ov = set(speakers[f["train"]]) & set(speakers[f["test"]])
-    print("  fold {} [{}]: train {} | val {} ({} spk) | test {} | overlap {}".format(
-        k, f["name"], len(f["train"]), len(f["val"]), f["val_speakers"],
-        len(f["test"]), len(ov)))
+    print(
+        "  fold {} [{}]: train {} | val {} ({} spk) | test {} | overlap {}".format(
+            k,
+            f["name"],
+            len(f["train"]),
+            len(f["val"]),
+            f["val_speakers"],
+            len(f["test"]),
+            len(ov),
+        )
+    )
+
 
 # ---------------------------------------------------------------------------
 # Train / evaluate one fold
@@ -776,29 +799,31 @@ def evaluate(model, indices):
     model.eval()
     preds = []
     for i in range(0, len(indices), BATCH_SIZE):
-        idx = indices[i:i + BATCH_SIZE]
+        idx = indices[i : i + BATCH_SIZE]
         preds.append(model(features(idx, train=False)).argmax(1).cpu().numpy())
     preds = np.concatenate(preds)
     tgts = all_labels[indices]
     wa = float((preds == tgts).mean())
-    recalls = [float((preds[tgts == c] == c).mean())
-               for c in range(NUM_CLASSES) if (tgts == c).any()]
+    recalls = [
+        float((preds[tgts == c] == c).mean())
+        for c in range(NUM_CLASSES)
+        if (tgts == c).any()
+    ]
     return wa, float(np.mean(recalls)), preds, tgts
 
 
 def run_fold(k, fold):
     global frontend
-    # Reseeded per fold, so every fold starts from a comparable initialisation
-    # and the fold index keeps them from being five identical runs.
     set_seed(SEED + k)
     frontend = build_frontend()
     model = build_model()
+    load_trained_model(model, LOAD_MODEL, frontend)
 
     fe_trainable = [p for p in frontend.parameters() if p.requires_grad]
-    # One optimizer, one autograd graph -- a learnable frontend trains with the
-    # classifier. mel has no parameters at all, so it contributes no group.
-    groups = [{"params": list(model.parameters()), "lr": LR,
-               "weight_decay": WEIGHT_DECAY}]
+
+    groups = [
+        {"params": list(model.parameters()), "lr": LR, "weight_decay": WEIGHT_DECAY}
+    ]
     if fe_trainable:
         groups.append({"params": fe_trainable, "lr": LEAF_LR, "weight_decay": 0.0})
     optimizer = optim.AdamW(groups)
@@ -846,47 +871,81 @@ def run_fold(k, fold):
             torch.set_rng_state(_ck["torch_rng"])
             if _ck.get("cuda_rng") is not None and torch.cuda.is_available():
                 torch.cuda.set_rng_state_all(_ck["cuda_rng"])
-            print("  resuming fold {} at epoch {}/{} (best val UAR {:.2f}%)".format(
-                k, start_epoch + 1, NUM_EPOCHS, best_uar * 100))
+            print(
+                "  resuming fold {} at epoch {}/{} (best val UAR {:.2f}%)".format(
+                    k, start_epoch + 1, NUM_EPOCHS, best_uar * 100
+                )
+            )
         except Exception as _e:
             # A checkpoint from an incompatible configuration is not worth
             # crashing a multi-hour job over. Say so and train the fold fresh.
-            print("  ignoring {}: {}: {}".format(
-                os.path.basename(last_path), type(_e).__name__, _e))
+            print(
+                "  ignoring {}: {}: {}".format(
+                    os.path.basename(last_path), type(_e).__name__, _e
+                )
+            )
             best_uar, log, start_epoch = -1.0, [], 0
 
     if k == 0:
-        print("\nFrontend: {} | Model: {} | POOL={} LOSS={}".format(
-            FRONTEND, MODEL, POOL, LOSS))
-        print("  Trainable params -- frontend: {}, classifier: {}".format(
-            sum(p.numel() for p in fe_trainable),
-            sum(p.numel() for p in model.parameters())))
+        print(
+            "\nFrontend: {} | Model: {} | POOL={} LOSS={}".format(
+                FRONTEND, MODEL, POOL, LOSS
+            )
+        )
+        print(
+            "  Trainable params -- frontend: {}, classifier: {}".format(
+                sum(p.numel() for p in fe_trainable),
+                sum(p.numel() for p in model.parameters()),
+            )
+        )
         if MODEL == "convnext":
-            print("  ConvNeXt-{} (drop_path={}, pretrained={})".format(
-                CONVNEXT_SIZE, DROP_PATH, CONVNEXT_PRETRAINED))
+            print(
+                "  ConvNeXt-{} (drop_path={}, pretrained={})".format(
+                    CONVNEXT_SIZE, DROP_PATH, CONVNEXT_PRETRAINED
+                )
+            )
         if POOL == "attn":
             _bb = model.backbone
-            print("  Attentive pooling: {} heads ({} spiky) over {} tokens "
-                  "x {} dims -> {}".format(
-                      ATT_HEADS, max(0, min(ATT_SHARP, ATT_HEADS)),
-                      _bb.tokens, _bb.dim, model.pool.out_dim))
+            print(
+                "  Attentive pooling: {} heads ({} spiky) over {} tokens "
+                "x {} dims -> {}".format(
+                    ATT_HEADS,
+                    max(0, min(ATT_SHARP, ATT_HEADS)),
+                    _bb.tokens,
+                    _bb.dim,
+                    model.pool.out_dim,
+                )
+            )
             # Attentive pooling has to have something to choose between. A 2x2
             # grid is ConvNeXt at TARGET_SIZE=64: four tokens for five heads,
             # which is barely distinguishable from the average it replaces.
             if _bb.tokens < 9:
-                print("  WARNING: only {} tokens to pool over. The attentive "
-                      "arm cannot".format(_bb.tokens))
-                print("           differ much from POOL=cls here -- raise "
-                      "TARGET_SIZE ({} gives".format(TARGET_SIZE * 2))
-                print("           {} tokens) or lower PATCH before reading "
-                      "this comparison.".format(
-                          (TARGET_SIZE * 2 // 32) ** 2 if MODEL == "convnext"
-                          else (TARGET_SIZE * 2 // PATCH) ** 2))
-        print("  Methods: coord={} specaug={} norm={} pcen={}".format(
-            COORD_CHANNELS, SPEC_AUGMENT, NORMALIZE, PCEN))
+                print(
+                    "  WARNING: only {} tokens to pool over. The attentive "
+                    "arm cannot".format(_bb.tokens)
+                )
+                print(
+                    "           differ much from POOL=cls here -- raise "
+                    "TARGET_SIZE ({} gives".format(TARGET_SIZE * 2)
+                )
+                print(
+                    "           {} tokens) or lower PATCH before reading "
+                    "this comparison.".format(
+                        (TARGET_SIZE * 2 // 32) ** 2
+                        if MODEL == "convnext"
+                        else (TARGET_SIZE * 2 // PATCH) ** 2
+                    )
+                )
+        print(
+            "  Methods: coord={} specaug={} norm={} pcen={}".format(
+                COORD_CHANNELS, SPEC_AUGMENT, NORMALIZE, PCEN
+            )
+        )
 
-    print(f"\n{'=' * 66}\nFold {k} [{fold['name']}] -- {NUM_EPOCHS} epochs, "
-          f"{n_train} train / {len(val_idx)} val / {len(test_idx)} test\n{'=' * 66}")
+    print(
+        f"\n{'=' * 66}\nFold {k} [{fold['name']}] -- {NUM_EPOCHS} epochs, "
+        f"{n_train} train / {len(val_idx)} val / {len(test_idx)} test\n{'=' * 66}"
+    )
 
     for epoch in range(start_epoch, NUM_EPOCHS):
         t0 = time.time()
@@ -896,7 +955,7 @@ def run_fold(k, fold):
         epoch_loss, correct = 0.0, 0
 
         for b in range(num_batches):
-            idx = perm[b * BATCH_SIZE:min((b + 1) * BATCH_SIZE, n_train)]
+            idx = perm[b * BATCH_SIZE : min((b + 1) * BATCH_SIZE, n_train)]
             y = torch.from_numpy(all_labels[idx]).to(device)
             out = model(features(idx, train=True))
             loss = am_softmax_loss(out, y) if LOSS == "amsoftmax" else ce(out, y)
@@ -910,37 +969,68 @@ def run_fold(k, fold):
 
         scheduler.step()
         val_wa, val_uar, _, _ = evaluate(model, val_idx)
-        log.append(dict(fold=k, epoch=epoch + 1, loss=epoch_loss / n_train,
-                        train_wa=correct / n_train * 100, val_wa=val_wa * 100,
-                        val_uar=val_uar * 100))
+        log.append(
+            dict(
+                fold=k,
+                epoch=epoch + 1,
+                loss=epoch_loss / n_train,
+                train_wa=correct / n_train * 100,
+                val_wa=val_wa * 100,
+                val_uar=val_uar * 100,
+            )
+        )
         star = ""
         if val_uar > best_uar:
             best_uar = val_uar
-            torch.save({"model": model.state_dict(),
-                        "frontend": frontend.state_dict()}, best_path)
+            torch.save(
+                {"model": model.state_dict(), "frontend": frontend.state_dict()},
+                best_path,
+            )
             star = "  *"
-        print("  epoch {:3d}/{}  loss {:.4f}  train {:.2f}%  val WA {:.2f}%  "
-              "UAR {:.2f}%  {:.0f}s{}".format(
-                  epoch + 1, NUM_EPOCHS, epoch_loss / n_train,
-                  correct / n_train * 100, val_wa * 100, val_uar * 100,
-                  time.time() - t0, star))
+        print(
+            "  epoch {:3d}/{}  loss {:.4f}  train {:.2f}%  val WA {:.2f}%  "
+            "UAR {:.2f}%  {:.0f}s{}".format(
+                epoch + 1,
+                NUM_EPOCHS,
+                epoch_loss / n_train,
+                correct / n_train * 100,
+                val_wa * 100,
+                val_uar * 100,
+                time.time() - t0,
+                star,
+            )
+        )
 
         # Via a temporary file: a kill during the write must not leave a
         # truncated checkpoint where the last good one was.
         if RESUME_FOLD:
             _tmp = last_path + ".tmp"
-            torch.save({"epoch": epoch + 1,
-                        "model": model.state_dict(),
-                        "frontend": frontend.state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                        "scheduler": scheduler.state_dict(),
-                        "best_uar": best_uar, "log": log,
-                        "np_rng": np.random.get_state(),
-                        "torch_rng": torch.get_rng_state(),
-                        "cuda_rng": (torch.cuda.get_rng_state_all()
-                                     if torch.cuda.is_available() else None)},
-                       _tmp)
+            torch.save(
+                {
+                    "epoch": epoch + 1,
+                    "model": model.state_dict(),
+                    "frontend": frontend.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "best_uar": best_uar,
+                    "log": log,
+                    "np_rng": np.random.get_state(),
+                    "torch_rng": torch.get_rng_state(),
+                    "cuda_rng": (
+                        torch.cuda.get_rng_state_all()
+                        if torch.cuda.is_available()
+                        else None
+                    ),
+                },
+                _tmp,
+            )
             os.replace(_tmp, last_path)
+
+    # Save model weights from the last epoch.
+    torch.save(model.state_dict(), os.path.join(RESULT_DIR, f"last_model_fold{k}.pth"))
+    torch.save(
+        frontend.state_dict(), os.path.join(RESULT_DIR, f"last_frontend_fold{k}.pth")
+    )
 
     # Test on the best-val checkpoint, never the last one.
     ck = torch.load(best_path, map_location=device)
@@ -948,8 +1038,11 @@ def run_fold(k, fold):
     frontend.load_state_dict(ck["frontend"])
     test_wa, test_uar, preds, tgts = evaluate(model, test_idx)
     train_wa, _, _, _ = evaluate(model, train_idx)
-    print("  fold {} TEST: WA {:.2f}%  UAR {:.2f}%  (train WA {:.2f}%)".format(
-        k, test_wa * 100, test_uar * 100, train_wa * 100))
+    print(
+        "  fold {} TEST: WA {:.2f}%  UAR {:.2f}%  (train WA {:.2f}%)".format(
+            k, test_wa * 100, test_uar * 100, train_wa * 100
+        )
+    )
 
     # The caller is about to write this fold's row, after which the resume
     # checkpoint is dead weight -- and a stale one would have a finished fold
@@ -961,10 +1054,20 @@ def run_fold(k, fold):
     cm = np.zeros((NUM_CLASSES, NUM_CLASSES), dtype=int)
     for t, p in zip(tgts, preds):
         cm[t][p] += 1
-    return dict(fold=k, name=fold["name"], n_test=len(test_idx),
-                val_speaker=fold["val_speaker"], best_val_uar=best_uar * 100,
-                test_wa=test_wa * 100, test_uar=test_uar * 100,
-                train_wa=train_wa * 100), cm, log
+    return (
+        dict(
+            fold=k,
+            name=fold["name"],
+            n_test=len(test_idx),
+            val_speaker=fold["val_speaker"],
+            best_val_uar=best_uar * 100,
+            test_wa=test_wa * 100,
+            test_uar=test_uar * 100,
+            train_wa=train_wa * 100,
+        ),
+        cm,
+        log,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -979,13 +1082,20 @@ cm_path = os.path.join(RESULT_DIR, "confusion_{}_fold{}.csv")
 # Without them a NUM_EPOCHS=2 smoke test would leave 5 rows behind and the real
 # 30-epoch run would skip every fold as already done.
 TAG = "{}|{}{}|{}|c{}|pool{}|h{}|{}|e{}|t{}|s{}".format(
-    FRONTEND, MODEL,
+    FRONTEND,
+    MODEL,
     # ConvNeXt-tiny and ConvNeXt-base are different experiments; without the
     # size in the tag the second would skip the first's folds as already done.
     ":" + CONVNEXT_SIZE if MODEL == "convnext" else "",
     IEMOCAP_CLASSES if DATASET == "iemocap" else "6",
-    NUM_CLASSES, POOL, ATT_HEADS if POOL == "attn" else 0, LOSS,
-    NUM_EPOCHS, TARGET_SIZE, SEED)
+    NUM_CLASSES,
+    POOL,
+    ATT_HEADS if POOL == "attn" else 0,
+    LOSS,
+    NUM_EPOCHS,
+    TARGET_SIZE,
+    SEED,
+)
 # Short, filesystem-safe stamp so one arm's checkpoints cannot be mistaken for
 # another's -- every arm shares RESULT_DIR.
 TAG_ID = hashlib.md5(TAG.encode()).hexdigest()[:8]
@@ -996,22 +1106,27 @@ if os.path.exists(folds_path):
     if "tag" in _prev.columns:
         done = set(_prev[_prev["tag"] == TAG]["fold"].astype(int))
     if done:
-        print("\nAlready in folds.csv for this config ({}): folds {}".format(
-            TAG, sorted(done)))
+        print(
+            "\nAlready in folds.csv for this config ({}): folds {}".format(
+                TAG, sorted(done)
+            )
+        )
 
 logs = []
-for k in (range(len(folds)) if FOLD < 0 else [FOLD]):
+for k in range(len(folds)) if FOLD < 0 else [FOLD]:
     if k in done:
         print(f"\nFold {k}: already recorded, skipping (delete its row to redo)")
         continue
     row, cm, log = run_fold(k, folds[k])
     row["tag"] = TAG
     pd.DataFrame(cm, index=CLASS_NAMES, columns=CLASS_NAMES).to_csv(
-        cm_path.format(TAG_ID, k))
+        cm_path.format(TAG_ID, k)
+    )
     logs.extend(log)
     # Written per fold, not at the end: a job that dies in fold 3 keeps 0..2.
-    pd.DataFrame([row]).to_csv(folds_path, mode="a", index=False,
-                               header=not os.path.exists(folds_path))
+    pd.DataFrame([row]).to_csv(
+        folds_path, mode="a", index=False, header=not os.path.exists(folds_path)
+    )
 
 if logs:
     # Every arm writes into the same RESULT_DIR, so this file holds the epochs
@@ -1019,11 +1134,20 @@ if logs:
     # `fold` alone cannot separate them, and epoch restarts at 1 per fold.
     # TAG is the same string folds.csv is keyed by, so the two join on it.
     lp = os.path.join(RESULT_DIR, "training_log.csv")
-    _ident = {"run": TAG, "run_id": TAG_ID, "frontend": FRONTEND, "model": MODEL,
-              # loss_fn, not loss: the per-epoch rows already carry `loss`
-              # as the numeric training loss, and merging would drop this one.
-              "dataset": DATASET, "pool": POOL, "loss_fn": LOSS,
-              "target_size": TARGET_SIZE, "patch": PATCH, "seed": SEED}
+    _ident = {
+        "run": TAG,
+        "run_id": TAG_ID,
+        "frontend": FRONTEND,
+        "model": MODEL,
+        # loss_fn, not loss: the per-epoch rows already carry `loss`
+        # as the numeric training loss, and merging would drop this one.
+        "dataset": DATASET,
+        "pool": POOL,
+        "loss_fn": LOSS,
+        "target_size": TARGET_SIZE,
+        "patch": PATCH,
+        "seed": SEED,
+    }
     _log_df = pd.DataFrame([{**_ident, **_r} for _r in logs])
     # Concat rather than mode="a": a plain append writes no header, so rows
     # written before this stamp existed would silently take the new columns'
@@ -1038,70 +1162,114 @@ have = pd.read_csv(folds_path, dtype={"name": str})
 have = have[have["tag"] == TAG].drop_duplicates("fold").sort_values("fold")
 
 print("\n" + "=" * 66)
-print("Run9 | {} | {} + {} | {} classes | POOL={} LOSS={}".format(
-    DATASET, FRONTEND, MODEL, NUM_CLASSES, POOL, LOSS))
+print(
+    "Run9 | {} | {} + {} | {} classes | POOL={} LOSS={}".format(
+        DATASET, FRONTEND, MODEL, NUM_CLASSES, POOL, LOSS
+    )
+)
 print("-" * 66)
 for _, r in have.iterrows():
-    print("  fold {} [{}]  WA {:.2f}%  UAR {:.2f}%  ({} clips)".format(
-        int(r["fold"]), r["name"], r["test_wa"], r["test_uar"], int(r["n_test"])))
+    print(
+        "  fold {} [{}]  WA {:.2f}%  UAR {:.2f}%  ({} clips)".format(
+            int(r["fold"]), r["name"], r["test_wa"], r["test_uar"], int(r["n_test"])
+        )
+    )
 
 if len(have) < len(folds):
     print("-" * 66)
-    print("{} of {} folds done -- run the rest before reading a CV number.".format(
-        len(have), len(folds)))
+    print(
+        "{} of {} folds done -- run the rest before reading a CV number.".format(
+            len(have), len(folds)
+        )
+    )
     print("=" * 66)
     raise SystemExit(0)
 
 wa_m, wa_s = have["test_wa"].mean(), have["test_wa"].std(ddof=0)
 ua_m, ua_s = have["test_uar"].mean(), have["test_uar"].std(ddof=0)
 print("-" * 66)
-print("  {}-fold CV   WA {:.2f} +- {:.2f} %   UA {:.2f} +- {:.2f} %".format(
-    len(have), wa_m, wa_s, ua_m, ua_s))
+print(
+    "  {}-fold CV   WA {:.2f} +- {:.2f} %   UA {:.2f} +- {:.2f} %".format(
+        len(have), wa_m, wa_s, ua_m, ua_s
+    )
+)
 print("  (chance = {:.1f}%)".format(100 / NUM_CLASSES))
-print("  mean train WA {:.2f}%  ->  generalization gap {:.1f} points".format(
-    have["train_wa"].mean(), have["train_wa"].mean() - wa_m))
+print(
+    "  mean train WA {:.2f}%  ->  generalization gap {:.1f} points".format(
+        have["train_wa"].mean(), have["train_wa"].mean() - wa_m
+    )
+)
 print("=" * 66)
 
 # Pooled confusion matrix across folds -- per-fold matrices stay on disk too.
-cms = [pd.read_csv(cm_path.format(TAG_ID, int(r["fold"])), index_col=0)
-       for _, r in have.iterrows()
-       if os.path.exists(cm_path.format(TAG_ID, int(r["fold"])))]
+cms = [
+    pd.read_csv(cm_path.format(TAG_ID, int(r["fold"])), index_col=0)
+    for _, r in have.iterrows()
+    if os.path.exists(cm_path.format(TAG_ID, int(r["fold"])))
+]
 if cms:
-    cm_df = pd.DataFrame(sum(c.values for c in cms),
-                         index=CLASS_NAMES, columns=CLASS_NAMES)
+    cm_df = pd.DataFrame(
+        sum(c.values for c in cms), index=CLASS_NAMES, columns=CLASS_NAMES
+    )
     cm_df.index.name = "True \\ Pred"
     print("\nConfusion Matrix (all folds pooled):")
     print(cm_df.to_string())
     cm_df.to_csv(os.path.join(RESULT_DIR, "confusion_matrix.csv"))
 
-run = {"script": "Run9.py", "frontend": FRONTEND, "model": MODEL,
-       "dataset": DATASET, "classes": NUM_CLASSES,
-       "iemocap_classes": IEMOCAP_CLASSES if DATASET == "iemocap" else "",
-       "cv": "session5fold" if DATASET == "iemocap" else "actor5fold",
-       "folds": len(have), "pool": POOL,
-       "att_heads": ATT_HEADS if POOL == "attn" else "",
-       "att_sharp": ATT_SHARP if POOL == "attn" else "",
-       "embed_dim": EMBED_DIM, "loss": LOSS,
-       "am_margin": AM_MARGIN if LOSS == "amsoftmax" else "",
-       "am_scale": AM_SCALE if LOSS == "amsoftmax" else "",
-       "epochs": NUM_EPOCHS, "batch": BATCH_SIZE, "lr": LR, "leaf_lr": LEAF_LR,
-       "weight_decay": WEIGHT_DECAY, "label_smoothing": LABEL_SMOOTHING,
-       "dropout": DROPOUT, "emb_dropout": EMB_DROPOUT, "dim": DIM,
-       "depth": DEPTH, "heads": HEADS, "mlp_dim": MLP_DIM, "patch": PATCH,
-       "dim_head": DIM_HEAD, "cnn_channels": CNN_CHANNELS,
-       "convnext_size": CONVNEXT_SIZE if MODEL == "convnext" else "",
-       "drop_path": DROP_PATH if MODEL == "convnext" else "",
-       "convnext_pretrained": CONVNEXT_PRETRAINED if MODEL == "convnext" else "",
-       "convnext_22k": CONVNEXT_22K if MODEL == "convnext" else "",
-       "target_size": TARGET_SIZE, "leaf_filters": LEAF_N_FILTERS,
-       "learn_pooling": LEARN_POOLING, "pcen": PCEN,
-       "coord_channels": COORD_CHANNELS, "spec_augment": SPEC_AUGMENT,
-       "freq_mask": FREQ_MASK, "time_mask": TIME_MASK, "normalize": NORMALIZE,
-       "fixed_seconds": FIXED_SECONDS, "seed": SEED, "clips": len(audio_files),
-       "train_wa": have["train_wa"].mean(),
-       "test_wa": wa_m, "test_wa_std": wa_s,
-       "test_uar": ua_m, "test_uar_std": ua_s,
-       "fold_uars": json.dumps([round(float(u), 2) for u in have["test_uar"]])}
+run = {
+    "script": "Run9.py",
+    "frontend": FRONTEND,
+    "model": MODEL,
+    "dataset": DATASET,
+    "classes": NUM_CLASSES,
+    "iemocap_classes": IEMOCAP_CLASSES if DATASET == "iemocap" else "",
+    "cv": "session5fold" if DATASET == "iemocap" else "actor5fold",
+    "folds": len(have),
+    "pool": POOL,
+    "att_heads": ATT_HEADS if POOL == "attn" else "",
+    "att_sharp": ATT_SHARP if POOL == "attn" else "",
+    "embed_dim": EMBED_DIM,
+    "loss": LOSS,
+    "am_margin": AM_MARGIN if LOSS == "amsoftmax" else "",
+    "am_scale": AM_SCALE if LOSS == "amsoftmax" else "",
+    "epochs": NUM_EPOCHS,
+    "batch": BATCH_SIZE,
+    "lr": LR,
+    "leaf_lr": LEAF_LR,
+    "weight_decay": WEIGHT_DECAY,
+    "label_smoothing": LABEL_SMOOTHING,
+    "dropout": DROPOUT,
+    "emb_dropout": EMB_DROPOUT,
+    "dim": DIM,
+    "depth": DEPTH,
+    "heads": HEADS,
+    "mlp_dim": MLP_DIM,
+    "patch": PATCH,
+    "dim_head": DIM_HEAD,
+    "cnn_channels": CNN_CHANNELS,
+    "convnext_size": CONVNEXT_SIZE if MODEL == "convnext" else "",
+    "drop_path": DROP_PATH if MODEL == "convnext" else "",
+    "convnext_pretrained": CONVNEXT_PRETRAINED if MODEL == "convnext" else "",
+    "convnext_22k": CONVNEXT_22K if MODEL == "convnext" else "",
+    "target_size": TARGET_SIZE,
+    "leaf_filters": LEAF_N_FILTERS,
+    "learn_pooling": LEARN_POOLING,
+    "pcen": PCEN,
+    "coord_channels": COORD_CHANNELS,
+    "spec_augment": SPEC_AUGMENT,
+    "freq_mask": FREQ_MASK,
+    "time_mask": TIME_MASK,
+    "normalize": NORMALIZE,
+    "fixed_seconds": FIXED_SECONDS,
+    "seed": SEED,
+    "clips": len(audio_files),
+    "train_wa": have["train_wa"].mean(),
+    "test_wa": wa_m,
+    "test_wa_std": wa_s,
+    "test_uar": ua_m,
+    "test_uar_std": ua_s,
+    "fold_uars": json.dumps([round(float(u), 2) for u in have["test_uar"]]),
+}
 
 sweep = os.path.join(RESULT_DIR, "sweep.csv")
 # Merge on column names rather than appending blind: the column set can grow
