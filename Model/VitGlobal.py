@@ -62,52 +62,6 @@ class Attention(nn.Module):
         out = rearrange(out, 'b h n d -> b n (h d)')
         return self.to_out(out)
 
-class LocalAttention(nn.Module):
-    def __init__(self, dim, heads=8, dim_head=64, window_size=3, dropout=0.):
-        super().__init__()
-        self.heads = heads
-        self.scale = dim_head ** -0.5
-        self.window_size = window_size  # window size for local attention
-
-        self.norm = nn.LayerNorm(dim)
-        self.to_qkv = nn.Linear(dim, dim_head * heads * 3, bias=False)
-        self.attend = nn.Softmax(dim=-1)
-        self.dropout = nn.Dropout(dropout)
-        self.to_out = nn.Linear(dim_head * heads, dim)
-
-    def forward(self, x):
-        x = self.norm(x)
-        b, n, d = x.shape
-        h = self.heads
-        dim_head = d // h
-
-        # compute QKV
-        qkv = self.to_qkv(x).chunk(3, dim=-1)
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=h), qkv)
-
-        # ---------------------
-        # local attention
-        # ---------------------
-        # pad sequence if necessary
-        pad = self.window_size // 2
-        k = torch.cat([torch.zeros(b, h, pad, dim_head, device=x.device), k,
-                       torch.zeros(b, h, pad, dim_head, device=x.device)], dim=2)
-        v = torch.cat([torch.zeros(b, h, pad, dim_head, device=x.device), v,
-                       torch.zeros(b, h, pad, dim_head, device=x.device)], dim=2)
-
-        out = []
-        for i in range(n):
-            k_local = k[:, :, i:i+self.window_size, :]  # select local window
-            v_local = v[:, :, i:i+self.window_size, :]
-            attn = torch.matmul(q[:, :, i:i+1, :], k_local.transpose(-1, -2)) * self.scale
-            attn = self.attend(attn)
-            attn = self.dropout(attn)
-            out.append(torch.matmul(attn, v_local))  # b h 1 d
-
-        out = torch.cat(out, dim=2)  # b h n d
-        out = rearrange(out, 'b h n d -> b n (h d)')
-        return self.to_out(out)
-
 class Transformer(nn.Module):
     def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout = 0.):
         super().__init__()

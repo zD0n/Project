@@ -1,6 +1,7 @@
 Dataset/
 results/
 results2/
+plot/
 weight/
 .venv/
 .ruff_cache/

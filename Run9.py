@@ -1,3 +1,4 @@
+import gc
 import hashlib
 import json
 import os
@@ -14,7 +15,7 @@ import torch.nn.functional as F
 from torch import nn, optim
 
 from leaf_pytorch.frontend import Leaf
-from Model import VitCnnGlobal, VitCnnLocal, VitGlobal, VitLocal, VitCnnGlobalButBigger
+from Model import ConvCLS, VitCnnGlobal, VitCnnLocal, VitGlobal, VitLocal, VitCnnGlobalButBigger, VitGlobalCNNLocal
 
 # ---------------------------------------------------------------------------
 # Config
@@ -51,42 +52,54 @@ def _env(name, default, cast=float):
 
 
 # LEAF Param
-LEAF_N_FILTERS = _env("LEAF_N_FILTERS", 64, int)
-TARGET_SIZE = _env("TARGET_SIZE", 64, int)
+LEAF_N_FILTERS = _env("LEAF_N_FILTERS", 80, int)
+TARGET_SIZE = _env("TARGET_SIZE", 128, int)
 WINDOW_LEN = _env("WINDOW_LEN", 25, float)
-LEAF_LR = _env("LEAF_LR", 1e-4)
-LEARN_POOLING = _env("LEARN_POOLING", 0, int)
+LEAF_LR = _env("LEAF_LR", 5e-5)
+LEARN_POOLING = _env("LEARN_POOLING", 1, int)
 PCEN = _env("PCEN", 1, int)
 
 
-NUM_EPOCHS = _env("NUM_EPOCHS", 15, int)
-BATCH_SIZE = _env("BATCH_SIZE", 5, int)
+NUM_EPOCHS = _env("NUM_EPOCHS", 30, int)
+BATCH_SIZE = _env("BATCH_SIZE", 32, int)
 LR = _env("LR", 3e-4)
 WEIGHT_DECAY = _env("WEIGHT_DECAY", 0.05)
 LABEL_SMOOTHING = _env("LABEL_SMOOTHING", 0.1)
-WARMUP_EPOCHS = _env("WARMUP_EPOCHS", 5, int)
+WARMUP_EPOCHS = _env("WARMUP_EPOCHS", 8, int)
 
 # Model Param
-DIM = _env("DIM", 256, int)
 DEPTH = _env("DEPTH", 6, int)
 HEADS = _env("HEADS", 8, int)
 MLP_DIM = _env("MLP_DIM", 1024, int)
 PATCH = _env("PATCH", 8, int)
-DIM_HEAD = _env("DIM_HEAD", 64, int)
+DIM_HEAD = _env("DIM_HEAD", 32, int)
+DIM = _env("DIM", HEADS * DIM_HEAD, int)
 CNN_CHANNELS = _env("CNN_CHANNELS", 64, int)
-DROPOUT = _env("DROPOUT", 0.2)
+DROPOUT = _env("DROPOUT", 0.3)
 EMB_DROPOUT = _env("EMB_DROPOUT", 0.1)
+POOL = os.environ.get("POOL", "cls").lower()
+LOSS = os.environ.get("LOSS", "ce").lower()
 
 # Dataset Param
 COORD_CHANNELS = _env("COORD_CHANNELS", 1, int)
 SPEC_AUGMENT = _env("SPEC_AUGMENT", 1, int)
 FREQ_MASK = _env("FREQ_MASK", 8, int)
-TIME_MASK = _env("TIME_MASK", 16, int)
+TIME_MASK = _env("TIME_MASK", 24, int)
 NORMALIZE = _env("NORMALIZE", 1, int)
 
 # ---------------------------------------------------------------------------
 
-MODEL = os.environ.get("MODEL", "cnn_vit_bigger").lower()
+
+#     "vit": VitGlobal,
+#     "vit_local": VitLocal,
+#     "cnn_vit_bigger": VitCnnGlobalButBigger,
+#     "cnn_vit": VitCnnGlobal,
+#     "cnn_vit_local": VitCnnLocal,
+#   "vit_global_cnn_local": VitGlobalCNNLocal,
+#   "convcls": ConvCLS,
+
+
+MODEL = os.environ.get("MODEL", "convcls").lower()
 
 # ---------------------------------------------------------------------------
 
@@ -97,20 +110,16 @@ HEAD_INIT_SCALE = _env("HEAD_INIT_SCALE", 1.0)
 CONVNEXT_PRETRAINED = _env("CONVNEXT_PRETRAINED", 0, int)  # downloads ImageNet weights
 CONVNEXT_22K = _env("CONVNEXT_22K", 0, int)  # 22k instead of 1k weights
 
-# --- what Run9 adds --------------------------------------------------------
-POOL = os.environ.get("POOL", "attn").lower()
 ATT_HEADS = _env("ATT_HEADS", 5, int)
 ATT_SHARP = _env("ATT_SHARP", 3, int)
 ATT_HIDDEN = _env("ATT_HIDDEN", 64, int)
 EMBED_DIM = _env("EMBED_DIM", 256, int)
 IEMOCAP_CLASSES = os.environ.get("IEMOCAP_CLASSES", "4").lower()
-LOSS = os.environ.get("LOSS", "ce").lower()
 AM_MARGIN = _env("AM_MARGIN", 0.2)
 AM_SCALE = _env("AM_SCALE", 30.0)
 CV_FOLDS = _env("CV_FOLDS", 5, int)
-VAL_FRAC = _env("VAL_FRAC", 0.125)  # of the TRAINING speakers, per fold
+VAL_FRAC = _env("VAL_FRAC", 0.25)
 FOLD = _env("FOLD", -1, int)
-# 1 = pick a killed fold back up where it stopped; 0 = always start it over.
 RESUME_FOLD = _env("RESUME_FOLD", 1, int)
 LOAD_MODEL = os.environ.get("LOAD_MODEL", "")
 
@@ -275,14 +284,14 @@ print(
 
 # One fixed input length for every batch: variable shapes make the CUDA
 # allocator grow without bound and epochs get slower and slower.
-FIXED_SECONDS = _env("FIXED_SECONDS", 0.0)
+FIXED_SECONDS = _env("FIXED_SECONDS", 6.0)
 if FIXED_SECONDS <= 0:
     FIXED_SECONDS = min(6.0, max(2.0, float(np.percentile(lengths, 75)) / SAMPLE_RATE))
 FIXED_SAMPLES = int(round(FIXED_SECONDS * SAMPLE_RATE))
 _trunc = int((lengths > FIXED_SAMPLES).sum())
 print(
     f"Fixed input window: {FIXED_SECONDS:.2f}s ({FIXED_SAMPLES} samples) | "
-    f"{_trunc} of {len(lengths)} clips cropped ({_trunc / len(lengths) * 100:.1f}%)"
+    f"{_trunc} of {len(lengths)} clips cropped ({_trunc / len(lengths) * 100:.1f}%) "
 )
 
 
@@ -339,31 +348,41 @@ def spec_augment(x):
 
 def features(indices, train):
     """(B, VIT_CHANNELS, TARGET, TARGET) on `device`.
-
-    leaf_pytorch emits (B, n_filters, frames) i.e. freq-major; the transpose
-    keeps time on rows, matching Run5..Run8.
+    
+    Stabilized with explicit frequency-plane standardization to prevent 
+    unstable gradients and rescue underfitting.
     """
     wav = make_batch(indices, train=train)
     x = torch.from_numpy(wav).to(device, non_blocking=True).unsqueeze(1)
+    
     feats = frontend(x)  # (B, n_filters, frames)
+    
     if FRONTEND == "mel" or not PCEN:
         feats = torch.log(feats + 1e-5)
+        
     feats = feats.transpose(1, 2).unsqueeze(1)  # (B, 1, frames, filters)
+    
     feats = F.interpolate(
         feats, size=(TARGET_SIZE, TARGET_SIZE), mode="bilinear", align_corners=False
     )
+    
     if NORMALIZE:
+        eps = 1e-5
         mean = feats.mean(dim=(-2, -1), keepdim=True)
-        std = feats.std(dim=(-2, -1), keepdim=True)
-        feats = (feats - mean) / (std + 1e-5)
+        var = feats.var(dim=(-2, -1), keepdim=True, unbiased=False)
+        feats = (feats - mean) / torch.sqrt(var + eps)
+
+        feats = torch.clamp(feats, min=-4.0, max=4.0)
+    # ----------------------------------------------------------
+    
     if train and SPEC_AUGMENT:
         feats = spec_augment(feats)
+        
     if COORD_CHANNELS:
         feats = torch.cat(
             [feats, coord_planes(feats.shape[0], TARGET_SIZE, TARGET_SIZE)], dim=1
         )
     return feats
-
 
 # ---------------------------------------------------------------------------
 # Model
@@ -374,6 +393,8 @@ _MODELS = {
     "cnn_vit_bigger": VitCnnGlobalButBigger,
     "cnn_vit": VitCnnGlobal,
     "cnn_vit_local": VitCnnLocal,
+    "vit_global_cnn_local": VitGlobalCNNLocal,
+    "frank": ConvCLS,
 }
 
 _CONVNEXT_SIZES = {
@@ -428,11 +449,11 @@ class SelfAttentivePooling(nn.Module):
 
 
 class ViTBackbone(nn.Module):
-    """One of the four hand-rolled ViTs in Model/, built exactly as Run8 builds
+    """One of the hand-rolled ViTs in Model/, built exactly as Run8 builds
     it -- no edits to those files.
 
     A forward hook on `.transformer` catches the token sequence on the way
-    past; all four variants have that attribute, so this needs no per-variant
+    past; every variant has that attribute, so this needs no per-variant
     special-casing and stays in step if those files change. The trunk's own
     mlp_head becomes an Identity, since the classifier here is our own.
     """
@@ -597,7 +618,22 @@ def build_convnext():
 
 
 def build_model():
-    if MODEL == "convnext":
+    if MODEL == "frank":
+        kw = dict(
+            image_size=(TARGET_SIZE, TARGET_SIZE),
+            patch_size=(PATCH, PATCH),
+            num_classes=NUM_CLASSES,
+            dim=DIM,
+            depth=DEPTH,
+            channels=VIT_CHANNELS,
+            drop_path=DROP_PATH
+        )
+        if POOL == "attn":
+            backbone = ViTBackbone(ConvCLS.ConvNeXtTokenBlock(**kw))
+        else:
+            backbone = ViTBackbone(ConvCLS.ConvNeXtClsModel(**kw))
+        return Run9Net(backbone, NUM_CLASSES).to(device)
+    elif MODEL == "convnext":
         backbone = ConvNeXtBackbone(build_convnext())
     else:
         kw = dict(
@@ -613,11 +649,16 @@ def build_model():
             dropout=DROPOUT,
             emb_dropout=EMB_DROPOUT,
         )
-        if MODEL.startswith("cnn_"):
+        if MODEL.startswith("cnn_") or MODEL == "vit_global_cnn_local":
             kw["cnn_channels"] = CNN_CHANNELS
         if MODEL != "cnn_vit_local":
             kw["dim_head"] = DIM_HEAD
         backbone = ViTBackbone(_MODELS[MODEL].ViT(**kw))
+        if MODEL == "vit_global_cnn_local":
+            # Its fusion sequence is [fusion CLS] + global (CLS + patches) +
+            # local patches; forward_tokens drops the fusion CLS, so 2N + 1
+            # tokens come back rather than the N patches ViTBackbone assumes.
+            backbone.tokens = 2 * (TARGET_SIZE // PATCH) ** 2 + 1
     return Run9Net(backbone, NUM_CLASSES).to(device)
 
 
@@ -814,10 +855,13 @@ def evaluate(model, indices):
 
 def run_fold(k, fold):
     global frontend
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
     set_seed(SEED + k)
     frontend = build_frontend()
     model = build_model()
-    load_trained_model(model, LOAD_MODEL, frontend)
+    # load_trained_model(model, LOAD_MODEL, frontend)
 
     fe_trainable = [p for p in frontend.parameters() if p.requires_grad]
 
@@ -1054,6 +1098,7 @@ def run_fold(k, fold):
     cm = np.zeros((NUM_CLASSES, NUM_CLASSES), dtype=int)
     for t, p in zip(tgts, preds):
         cm[t][p] += 1
+
     return (
         dict(
             fold=k,
