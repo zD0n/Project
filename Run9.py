@@ -1,6 +1,7 @@
 import gc
 import hashlib
 import json
+import math
 import os
 import time
 import warnings
@@ -21,6 +22,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "Fro
 from leaf_pytorch.frontend import Leaf
 from Model import ConvCLS, VitCnnGlobal, VitCnnLocal, VitGlobal, VitLocal, VitCnnGlobalButBigger, VitGlobalCNNLocal, CnnOnly
 
+from mfcc_frontend import get_dct_matrix
+from cqt_frontend import PyTorchCQT
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -42,12 +45,17 @@ FRONTEND = os.environ.get("FRONTEND", "leaf").lower()
 
 # ---------------------------------------------------------------------------
 
-if FRONTEND not in ("leaf", "mel", "sincnet"):
-    raise SystemExit(f"FRONTEND={FRONTEND!r} unknown; choose 'leaf', 'mel' or 'sincnet'")
+if FRONTEND not in ("leaf", "mel", "mfcc", "cqt", "sincnet"):
+    raise SystemExit(
+        f"FRONTEND={FRONTEND!r} unknown; choose 'leaf', 'mel', 'mfcc', 'cqt' or 'sincnet'"
+    )
 
 RESULTS_ROOT = os.environ.get("RESULTS_ROOT", "./results")
 RESULT_DIR = os.path.join(
-    RESULTS_ROOT, "{}Torch_CV".format({"leaf": "Leaf", "mel": "Mel", "sincnet": "Sinc"}[FRONTEND])
+    RESULTS_ROOT,
+    "{}Torch_CV".format(
+        {"leaf": "Leaf", "mel": "Mel", "mfcc": "Mfcc", "cqt": "Cqt", "sincnet": "Sinc"}[FRONTEND]
+    ),
 )
 
 
@@ -124,7 +132,7 @@ AM_MARGIN = _env("AM_MARGIN", 0.2)
 AM_SCALE = _env("AM_SCALE", 30.0)
 CV_FOLDS = _env("CV_FOLDS", 5, int)
 VAL_FRAC = _env("VAL_FRAC", 0.25)
-FOLD = _env("FOLD", -1, int)
+FOLD = _env("FOLD", 0, int)
 RESUME_FOLD = _env("RESUME_FOLD", 1, int)
 LOAD_MODEL = os.environ.get("LOAD_MODEL", "")
 
@@ -350,7 +358,6 @@ def spec_augment(x):
             mask[i, :, :, f0 : f0 + f] = 0.0
     return x * mask
 
-
 def features(indices, train):
     """(B, VIT_CHANNELS, TARGET, TARGET) on `device`.
     
@@ -360,13 +367,26 @@ def features(indices, train):
     wav = make_batch(indices, train=train)
     x = torch.from_numpy(wav).to(device, non_blocking=True).unsqueeze(1)
     
-    feats = frontend(x)  # (B, n_filters, frames)
+    # --- 1. FRONTEND PROCESSING PIPELINE SELECTION ---
+    # One contract for every frontend: (B, bins/filters, frames).
+    # cqt yields (B, n_bins, frames), the rest (B, n_filters, frames).
+    feats = frontend(x)
     
-    # SincNet already ends in LayerNorm (signed), so no log for it.
-    if FRONTEND == "mel" or (FRONTEND == "leaf" and not PCEN):
+    # Log compression (Vital normalization step before DCT or downstream attention blocks)
+    if FRONTEND in ["mel", "mfcc", "cqt"] or (FRONTEND == "leaf" and not PCEN):
         feats = torch.log(feats + 1e-5)
         
-    feats = feats.transpose(1, 2).unsqueeze(1)  # (B, 1, frames, filters)
+    # --- 2. CEPMSTRUM COMPRESSION PIPELINE (MFCC) ---
+    if FRONTEND == "mfcc":
+        n_mfcc = 20  
+        # Generating dynamically to match whatever output size frontend(x) yields
+        dct_mat = get_dct_matrix(n_filters=feats.shape[1], n_mfcc=n_mfcc, device=x.device)
+        
+        # Batch matrix multiplication: (B, n_mfcc, n_filters) @ (B, n_filters, frames)
+        feats = torch.matmul(dct_mat, feats) # Shape: (B, n_mfcc, frames)
+        
+    # ----------------------------------------------------------
+    feats = feats.transpose(1, 2).unsqueeze(1)  # (B, 1, frames, bins/filters/mfccs)
     
     feats = F.interpolate(
         feats, size=(TARGET_SIZE, TARGET_SIZE), mode="bilinear", align_corners=False
@@ -377,10 +397,8 @@ def features(indices, train):
         mean = feats.mean(dim=(-2, -1), keepdim=True)
         var = feats.var(dim=(-2, -1), keepdim=True, unbiased=False)
         feats = (feats - mean) / torch.sqrt(var + eps)
-
         feats = torch.clamp(feats, min=-4.0, max=4.0)
-    # ----------------------------------------------------------
-    
+        
     if train and SPEC_AUGMENT:
         feats = spec_augment(feats)
         
@@ -718,7 +736,9 @@ def load_trained_model(model, path, frontend=None):
 
 
 def build_frontend():
-    if FRONTEND == "mel":
+    # mfcc is this same mel spectrogram -- features() takes its DCT after the
+    # log, so the two share one frontend and differ only downstream.
+    if FRONTEND in ("mel", "mfcc"):
         import torchaudio
 
         # LEAF convolves over a 25 ms window and pools to a 10 ms hop; match
@@ -751,6 +771,11 @@ def build_frontend():
                 return self.mel(x.squeeze(1)) + 1e-6
 
         return MelFrontend().to(device)
+
+    if FRONTEND == "cqt":
+        # Magnitude CQT, fixed (buffers only, no learnable params), so the
+        # optimizer correctly sees an empty fe_trainable list for this arm.
+        return PyTorchCQT(sr=SAMPLE_RATE, device=device).to(device)
 
     if FRONTEND == "sincnet":
         from sinc_frontend import SincNetFrontend  # FrontEnd/ is on sys.path
