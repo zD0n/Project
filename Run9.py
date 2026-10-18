@@ -14,6 +14,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn, optim
 
+# leaf_pytorch lives in FrontEnd/, not on the default import path.
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "FrontEnd"))
+
 from leaf_pytorch.frontend import Leaf
 from Model import ConvCLS, VitCnnGlobal, VitCnnLocal, VitGlobal, VitLocal, VitCnnGlobalButBigger, VitGlobalCNNLocal, CnnOnly
 
@@ -38,12 +42,12 @@ FRONTEND = os.environ.get("FRONTEND", "leaf").lower()
 
 # ---------------------------------------------------------------------------
 
-if FRONTEND not in ("leaf", "mel"):
-    raise SystemExit(f"FRONTEND={FRONTEND!r} unknown; choose 'leaf' or 'mel'")
+if FRONTEND not in ("leaf", "mel", "sincnet"):
+    raise SystemExit(f"FRONTEND={FRONTEND!r} unknown; choose 'leaf', 'mel' or 'sincnet'")
 
 RESULTS_ROOT = os.environ.get("RESULTS_ROOT", "./results")
 RESULT_DIR = os.path.join(
-    RESULTS_ROOT, "{}Torch_CV".format("Leaf" if FRONTEND == "leaf" else "Mel")
+    RESULTS_ROOT, "{}Torch_CV".format({"leaf": "Leaf", "mel": "Mel", "sincnet": "Sinc"}[FRONTEND])
 )
 
 
@@ -358,7 +362,8 @@ def features(indices, train):
     
     feats = frontend(x)  # (B, n_filters, frames)
     
-    if FRONTEND == "mel" or not PCEN:
+    # SincNet already ends in LayerNorm (signed), so no log for it.
+    if FRONTEND == "mel" or (FRONTEND == "leaf" and not PCEN):
         feats = torch.log(feats + 1e-5)
         
     feats = feats.transpose(1, 2).unsqueeze(1)  # (B, 1, frames, filters)
@@ -746,6 +751,13 @@ def build_frontend():
                 return self.mel(x.squeeze(1)) + 1e-6
 
         return MelFrontend().to(device)
+
+    if FRONTEND == "sincnet":
+        from sinc_frontend import SincNetFrontend  # FrontEnd/ is on sys.path
+
+        return SincNetFrontend(
+            n_filters=LEAF_N_FILTERS, sample_rate=SAMPLE_RATE, window_len=WINDOW_LEN
+        ).to(device)
 
     fe = Leaf(
         n_filters=LEAF_N_FILTERS,
