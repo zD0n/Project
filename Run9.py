@@ -41,7 +41,7 @@ SAMPLE_RATE = 16000
 
 # ---------------------------------------------------------------------------
 
-FRONTEND = os.environ.get("FRONTEND", "leaf").lower()
+FRONTEND = os.environ.get("FRONTEND", "mfcc").lower()
 
 # ---------------------------------------------------------------------------
 
@@ -51,12 +51,6 @@ if FRONTEND not in ("leaf", "mel", "mfcc", "cqt", "sincnet"):
     )
 
 RESULTS_ROOT = os.environ.get("RESULTS_ROOT", "./results")
-RESULT_DIR = os.path.join(
-    RESULTS_ROOT,
-    "{}Torch_CV".format(
-        {"leaf": "Leaf", "mel": "Mel", "mfcc": "Mfcc", "cqt": "Cqt", "sincnet": "Sinc"}[FRONTEND]
-    ),
-)
 
 
 def _env(name, default, cast=float):
@@ -202,7 +196,11 @@ else:
 NUM_CLASSES = max(EMOTION_MAP.values()) + 1
 if OTHERS_CLASS is not None:
     NUM_CLASSES = max(NUM_CLASSES, OTHERS_CLASS + 1)
-RESULT_DIR = os.path.join(RESULT_DIR, DATASET)
+# One folder per (frontend, model) arm: results/<Frontend>_CV_<model>/<corpus>.
+# MODEL is read above, so both halves of the name are known here.
+RESULT_DIR = os.path.join(
+    RESULTS_ROOT, "{}_CV_{}".format(FRONTEND.capitalize(), MODEL), DATASET
+)
 os.makedirs(RESULT_DIR, exist_ok=True)
 
 # Several labels can share an index (excited folds into happy at 4-way), so
@@ -1080,6 +1078,10 @@ def run_fold(k, fold):
         star = ""
         if val_uar > best_uar:
             best_uar = val_uar
+            # This dir lives on a shared filesystem and can be deleted under a
+            # running job by anything else writing to the same tree; recreating
+            # it costs nothing and keeps a multi-hour fold from dying at save.
+            os.makedirs(RESULT_DIR, exist_ok=True)
             torch.save(
                 {"model": model.state_dict(), "frontend": frontend.state_dict()},
                 best_path,
@@ -1103,6 +1105,7 @@ def run_fold(k, fold):
         # truncated checkpoint where the last good one was.
         if RESUME_FOLD:
             _tmp = last_path + ".tmp"
+            os.makedirs(RESULT_DIR, exist_ok=True)
             torch.save(
                 {
                     "epoch": epoch + 1,
