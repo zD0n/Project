@@ -35,6 +35,7 @@ Selectable in `Run6.py`, `Run7.py` and `Run8.py` via `-e MODEL=...`:
 | `cnn_vit` | `VitCnnGlobal` | CNN stem + global attention (default) |
 | `cnn_vit_local` | `VitCnnLocal` | CNN stem + local attention |
 | `convnext` | `ConvNeXt` | pure conv, no attention - **`Run8.py` / `Run9.py`** |
+| `cnn_only` | `CnnOnly` (`PureCNN`) | pure CNN: `VitCnnGlobal`'s CNN stem, attention removed — **`Run9.py` only** |
 | `vit_b16` | timm `VisionTransformer` | standard ViT-B/16, can load ImageNet weights — **`Run8.py` only** |
 
 ### `MODEL=vit_b16`

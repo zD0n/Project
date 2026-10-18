@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from torch import nn, optim
 
 from leaf_pytorch.frontend import Leaf
-from Model import ConvCLS, VitCnnGlobal, VitCnnLocal, VitGlobal, VitLocal, VitCnnGlobalButBigger, VitGlobalCNNLocal
+from Model import ConvCLS, VitCnnGlobal, VitCnnLocal, VitGlobal, VitLocal, VitCnnGlobalButBigger, VitGlobalCNNLocal, CnnOnly
 
 # ---------------------------------------------------------------------------
 # Config
@@ -82,7 +82,7 @@ LOSS = os.environ.get("LOSS", "ce").lower()
 
 # Dataset Param
 COORD_CHANNELS = _env("COORD_CHANNELS", 1, int)
-SPEC_AUGMENT = _env("SPEC_AUGMENT", 1, int)
+SPEC_AUGMENT = _env("SPEC_AUGMENT", 0, int)
 FREQ_MASK = _env("FREQ_MASK", 8, int)
 TIME_MASK = _env("TIME_MASK", 24, int)
 NORMALIZE = _env("NORMALIZE", 1, int)
@@ -97,9 +97,10 @@ NORMALIZE = _env("NORMALIZE", 1, int)
 #     "cnn_vit_local": VitCnnLocal,
 #   "vit_global_cnn_local": VitGlobalCNNLocal,
 #   "convcls": ConvCLS,
+#   "cnn_only": CnnOnly,   (PureCNN -- VitCnnGlobal's CNN path with the attention removed)
 
 
-MODEL = os.environ.get("MODEL", "convcls").lower()
+MODEL = os.environ.get("MODEL", "cnn_only").lower()
 
 # ---------------------------------------------------------------------------
 
@@ -395,6 +396,7 @@ _MODELS = {
     "cnn_vit_local": VitCnnLocal,
     "vit_global_cnn_local": VitGlobalCNNLocal,
     "frank": ConvCLS,
+    "cnn_only": CnnOnly,
 }
 
 _CONVNEXT_SIZES = {
@@ -635,6 +637,21 @@ def build_model():
         return Run9Net(backbone, NUM_CLASSES).to(device)
     elif MODEL == "convnext":
         backbone = ConvNeXtBackbone(build_convnext())
+    elif MODEL == "cnn_only":
+        # PureCNN is its own backbone (.dim, .tokens, forward_tokens,
+        # forward_pooled) -- no ViTBackbone hook, since there is no
+        # .transformer to catch tokens from.
+        backbone = _MODELS[MODEL].PureCNN(
+            image_size=(TARGET_SIZE, TARGET_SIZE),
+            patch_size=(PATCH, PATCH),
+            num_classes=NUM_CLASSES,
+            dim=DIM,
+            depth=DEPTH,
+            channels=VIT_CHANNELS,
+            cnn_channels=CNN_CHANNELS,
+            dropout=DROPOUT,
+            emb_dropout=EMB_DROPOUT,
+        )
     else:
         kw = dict(
             image_size=(TARGET_SIZE, TARGET_SIZE),
