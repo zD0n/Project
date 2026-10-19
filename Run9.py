@@ -85,6 +85,17 @@ DROPOUT = _env("DROPOUT", 0.3)
 EMB_DROPOUT = _env("EMB_DROPOUT", 0.1)
 POOL = os.environ.get("POOL", "cls").lower()
 LOSS = os.environ.get("LOSS", "ce").lower()
+# Class weights inside the CE loss, computed from each fold's TRAIN clips
+# only. 0 = off (plain CE, runs stay comparable), 1 = inverse-frequency
+# (aggressive: fold 0 gave ~1.04/1.61/1.29/0.61 and cost 4.8 WA there),
+# 2 = sqrt-inverse-frequency (soft, recommended). Ignored for LOSS=amsoftmax.
+CLASS_WEIGHT = _env("CLASS_WEIGHT", 0, int)
+# Eval-time logit adjustment (Menon et al. 2021): subtract tau * log(prior)
+# from the logits, prior = this fold's train class frequencies. Shifts the
+# decision boundary toward balanced per-class recall (UAR) without touching
+# training at all. 0 = off; tau=1.0 is the principled default, sweep 0.5/1.0
+# and read val UAR.
+LOGIT_ADJUST = _env("LOGIT_ADJUST", 0)
 
 # Dataset Param
 COORD_CHANNELS = _env("COORD_CHANNELS", 1, int)
@@ -92,6 +103,10 @@ SPEC_AUGMENT = _env("SPEC_AUGMENT", 0, int)
 FREQ_MASK = _env("FREQ_MASK", 8, int)
 TIME_MASK = _env("TIME_MASK", 24, int)
 NORMALIZE = _env("NORMALIZE", 1, int)
+# Eval-only multi-crop TTA: 1 = one crop per clip (the start, unchanged
+# behaviour), K > 1 = average softmax probabilities over K deterministic crops
+# spread start..end through each clip. Training is untouched.
+EVAL_CROPS = _env("EVAL_CROPS", 3, int)
 
 # ---------------------------------------------------------------------------
 
@@ -104,7 +119,7 @@ NORMALIZE = _env("NORMALIZE", 1, int)
 #   "vit_global_cnn_local": VitGlobalCNNLocal,
 #   "convcls": ConvCLS,
 #   "cnn_only": CnnOnly,   (PureCNN -- VitCnnGlobal's CNN path with the attention removed)
-
+#  "cnn_temporal": CnnTemporal
 
 MODEL = os.environ.get("MODEL", "cnn_only").lower()
 
@@ -198,10 +213,31 @@ if OTHERS_CLASS is not None:
     NUM_CLASSES = max(NUM_CLASSES, OTHERS_CLASS + 1)
 # One folder per (frontend, model) arm: results/<Frontend>_CV_<model>/<corpus>.
 # MODEL is read above, so both halves of the name are known here.
-RESULT_DIR = os.path.join(
-    RESULTS_ROOT, "{}_CV_{}".format(FRONTEND.capitalize(), MODEL), DATASET
+#
+# If that arm folder already exists, a new one is made with a numeric suffix
+# (Cqt_CV_cnn_temporal -> Cqt_CV_cnn_temporal_2 -> _3 ...) so an old run is
+# never overwritten. NEW_RUN_DIR=0 reuses the existing folder instead, which is
+# REQUIRED for resuming a killed job (last_*.pth) and for FOLD=k job splitting,
+# since both rely on finding the earlier run's files in the same folder.
+NEW_RUN_DIR = _env("NEW_RUN_DIR", 1, int)
+
+
+def unique_arm_dir(root, name):
+    path = os.path.join(root, name)
+    if not NEW_RUN_DIR or not os.path.exists(path):
+        return path
+    n = 2
+    while os.path.exists(os.path.join(root, "{}_{}".format(name, n))):
+        n += 1
+    return os.path.join(root, "{}_{}".format(name, n))
+
+
+ARM_DIR = unique_arm_dir(
+    RESULTS_ROOT, "{}_CV_{}".format(FRONTEND.capitalize(), MODEL)
 )
+RESULT_DIR = os.path.join(ARM_DIR, DATASET)
 os.makedirs(RESULT_DIR, exist_ok=True)
+print(f"Results folder: {RESULT_DIR}")
 
 # Several labels can share an index (excited folds into happy at 4-way), so
 # build the display names by joining rather than inverting the map.
@@ -309,19 +345,24 @@ print(
 # ---------------------------------------------------------------------------
 # Batching and features -- identical to Run8, so POOL=cls reproduces its model
 # ---------------------------------------------------------------------------
-def make_batch(indices, train=False):
+def make_batch(indices, train=False, crop=0.0):
     """(B, FIXED_SAMPLES) -- one constant shape all run.
 
     Clips longer than the window are cropped at a random offset while training
     (free augmentation) and from the start at eval, so results are
-    deterministic. Shorter clips are zero-padded.
+    deterministic. `crop` (0..1) moves the eval crop through the clip
+    (0 = start, 0.5 = middle, 1 = end) for multi-crop TTA; shorter clips are
+    zero-padded whatever the crop asks for.
     """
     batch = np.zeros((len(indices), FIXED_SAMPLES), dtype=np.float32)
     for j, i in enumerate(indices):
         x = all_audio[i]
         n = x.shape[0]
         if n > FIXED_SAMPLES:
-            off = np.random.randint(0, n - FIXED_SAMPLES + 1) if train else 0
+            if train:
+                off = np.random.randint(0, n - FIXED_SAMPLES + 1)
+            else:
+                off = int(round(crop * (n - FIXED_SAMPLES)))
             batch[j] = x[off : off + FIXED_SAMPLES]
         else:
             batch[j, :n] = x
@@ -356,13 +397,13 @@ def spec_augment(x):
             mask[i, :, :, f0 : f0 + f] = 0.0
     return x * mask
 
-def features(indices, train):
+def features(indices, train, crop=0.0):
     """(B, VIT_CHANNELS, TARGET, TARGET) on `device`.
     
     Stabilized with explicit frequency-plane standardization to prevent 
     unstable gradients and rescue underfitting.
     """
-    wav = make_batch(indices, train=train)
+    wav = make_batch(indices, train=train, crop=crop)
     x = torch.from_numpy(wav).to(device, non_blocking=True).unsqueeze(1)
     
     # --- 1. FRONTEND PROCESSING PIPELINE SELECTION ---
@@ -691,47 +732,15 @@ def build_model():
             kw["cnn_channels"] = CNN_CHANNELS
         if MODEL != "cnn_vit_local":
             kw["dim_head"] = DIM_HEAD
-        backbone = ViTBackbone(_MODELS[MODEL].ViT(**kw))
         if MODEL == "vit_global_cnn_local":
-            # Its fusion sequence is [fusion CLS] + global (CLS + patches) +
-            # local patches; forward_tokens drops the fusion CLS, so 2N + 1
-            # tokens come back rather than the N patches ViTBackbone assumes.
-            backbone.tokens = 2 * (TARGET_SIZE // PATCH) ** 2 + 1
+            # Its trunk has drop-path per residual branch; DROP_PATH=0 gives a
+            # plain deterministic control run.
+            kw["drop_path"] = DROP_PATH
+        backbone = ViTBackbone(_MODELS[MODEL].ViT(**kw))
+        # vit_global_cnn_local is a single-trunk ViT now -- the CNN injects
+        # local features into the patch embeddings before the transformer, so
+        # it returns the usual N patch tokens (+ CLS) and needs no special case.
     return Run9Net(backbone, NUM_CLASSES).to(device)
-
-
-def load_trained_model(model, path, frontend=None):
-
-    if not path or not os.path.exists(path):
-        print(f"  LOAD_MODEL not found: {path!r}")
-        return
-    temp = torch.load(path, map_location=device, weights_only=False)
-    if isinstance(temp, dict) and "model" in temp:
-        state = temp["model"]
-    elif isinstance(temp, dict) and all(
-        isinstance(v, torch.Tensor) for v in temp.values()
-    ):
-        state = temp
-    elif isinstance(temp, dict) and "vit" in temp:
-        state = temp["vit"]
-    else:
-        state = temp
-
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    if len(missing) > 0 and len(unexpected) == 0:
-        prefixed = {"backbone.net." + k: v for k, v in state.items()}
-        missing, unexpected = model.load_state_dict(prefixed, strict=False)
-    loaded = len(state) - len(missing) - len(unexpected)
-    print(
-        "  Loaded pretrained model from {}: {} params loaded, "
-        "{} missing, {} unexpected".format(
-            os.path.basename(path), loaded, len(missing), len(unexpected)
-        )
-    )
-    if frontend is not None and isinstance(temp, dict) and "frontend" in temp:
-        frontend.load_state_dict(temp["frontend"])
-        print("  Loaded frontend state.")
-
 
 def build_frontend():
     # mfcc is this same mel spectrogram -- features() takes its DCT after the
@@ -885,15 +894,38 @@ for k, f in enumerate(folds):
 # ---------------------------------------------------------------------------
 # Train / evaluate one fold
 # ---------------------------------------------------------------------------
+# Per-class logit bias for eval-time logit adjustment; run_fold() sets it from
+# the fold's train prior when LOGIT_ADJUST > 0, and evaluate() adds it to the
+# logits before the softmax. None = no adjustment (tau = 0).
+_logit_bias = None
+
+
 @torch.no_grad()
 def evaluate(model, indices):
-    """WA (accuracy) and UAR (mean per-class recall)."""
+    """WA (accuracy) and UAR (mean per-class recall).
+
+    With EVAL_CROPS > 1 each clip is scored K times -- deterministic crops
+    spread start..end through it -- and the softmax probabilities are
+    averaged before argmax. Most clips are longer than the FIXED_SECONDS
+    window, so the extra crops recover emotional content the single crop
+    never saw. With LOGIT_ADJUST > 0 the logits are shifted by the same
+    per-class bias on every crop before the softmax. Training loss/acc are
+    unaffected either way.
+    """
     frontend.eval()
     model.eval()
+    crops = np.linspace(0.0, 1.0, EVAL_CROPS) if EVAL_CROPS > 1 else [0.0]
     preds = []
     for i in range(0, len(indices), BATCH_SIZE):
         idx = indices[i : i + BATCH_SIZE]
-        preds.append(model(features(idx, train=False)).argmax(1).cpu().numpy())
+        probs = None
+        for c in crops:
+            logits = model(features(idx, train=False, crop=float(c)))
+            if _logit_bias is not None:
+                logits = logits + _logit_bias
+            p = F.softmax(logits, dim=1)
+            probs = p if probs is None else probs + p
+        preds.append(probs.argmax(1).cpu().numpy())
     preds = np.concatenate(preds)
     tgts = all_labels[indices]
     wa = float((preds == tgts).mean())
@@ -906,14 +938,13 @@ def evaluate(model, indices):
 
 
 def run_fold(k, fold):
-    global frontend
+    global frontend, _logit_bias
     import gc
     gc.collect()
     torch.cuda.empty_cache()
     set_seed(SEED + k)
     frontend = build_frontend()
     model = build_model()
-    # load_trained_model(model, LOAD_MODEL, frontend)
 
     fe_trainable = [p for p in frontend.parameters() if p.requires_grad]
 
@@ -931,9 +962,58 @@ def run_fold(k, fold):
         return 0.5 * (1.0 + np.cos(np.pi * p))
 
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_scale)
-    ce = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
 
     train_idx, val_idx, test_idx = fold["train"], fold["val"], fold["test"]
+    # Class weights from THIS fold's train clips only -- never val/test.
+    # Rebuilt per fold, because each leave-one-session-out fold sees a
+    # different class mix. Pairs with the val-UAR checkpoint selection:
+    # objective and selection metric both reward per-class recall. Weights
+    # scale the loss, so printed loss values are not comparable across
+    # CLASS_WEIGHT settings -- compare WA/UAR instead.
+    if CLASS_WEIGHT and LOSS == "ce":
+        cnt = np.bincount(all_labels[train_idx], minlength=NUM_CLASSES)
+        _w = cnt.sum() / (NUM_CLASSES * np.maximum(cnt, 1))
+        if CLASS_WEIGHT == 2:
+            _w = np.sqrt(_w)
+        ce = nn.CrossEntropyLoss(
+            label_smoothing=LABEL_SMOOTHING,
+            weight=torch.tensor(_w, dtype=torch.float32, device=device),
+        )
+        if k == 0:
+            print(
+                "  class weights mode {} (train fold): ".format(CLASS_WEIGHT)
+                + ", ".join(
+                    "{}={:.2f}".format(n, v) for n, v in zip(CLASS_NAMES, _w)
+                )
+            )
+    elif CLASS_WEIGHT and LOSS != "ce":
+        if k == 0:
+            print("  CLASS_WEIGHT ignored: LOSS={} has no weighted variant".format(LOSS))
+        ce = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+    else:
+        ce = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+
+    # Eval-time logit adjustment: a per-class bias that undoes the train
+    # prior in the decision rule -- minority classes (low prior) get a
+    # positive boost, majority damped. Set once per fold from the train
+    # counts and consumed by evaluate(); None = no adjustment. Same prior
+    # family as CLASS_WEIGHT, so leave one of the two at their off value
+    # while ablating -- they attack the same imbalance from two ends.
+    _logit_bias = None
+    if LOGIT_ADJUST > 0:
+        cnt = np.bincount(all_labels[train_idx], minlength=NUM_CLASSES)
+        _prior = np.maximum(cnt, 1) / max(1, cnt.sum())
+        _logit_bias = torch.tensor(
+            -LOGIT_ADJUST * np.log(_prior), dtype=torch.float32, device=device
+        )
+        if k == 0:
+            print(
+                "  logit adjustment tau={} (train fold): ".format(LOGIT_ADJUST)
+                + ", ".join(
+                    "{}={:+.2f}".format(n, v)
+                    for n, v in zip(CLASS_NAMES, _logit_bias.tolist())
+                )
+            )
     n_train = len(train_idx)
     num_batches = (n_train + BATCH_SIZE - 1) // BATCH_SIZE
     best_path = os.path.join(RESULT_DIR, f"best_{TAG_ID}_fold{k}.pth")
@@ -1248,6 +1328,9 @@ if logs:
         "loss_fn": LOSS,
         "target_size": TARGET_SIZE,
         "patch": PATCH,
+        "eval_crops": EVAL_CROPS,
+        "class_weight": CLASS_WEIGHT,
+        "logit_adjust": LOGIT_ADJUST,
         "seed": SEED,
     }
     _log_df = pd.DataFrame([{**_ident, **_r} for _r in logs])

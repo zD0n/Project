@@ -2,11 +2,15 @@
 DATASET=${DATASET:-iemocap}
 SCRIPT=Run9.py
 
-# Model comes from the first argument:
-#   bash run__.sh cnn_only
-#   bash run__.sh convnext NUM_EPOCHS=2 SEED=42
-# Falls back to $MODEL, then the old default, when no argument is given.
 MODEL=${1:-${MODEL:-vit}}
+POOL=${POOL:-attn}
+DEPTH=${DEPTH:-6}
+SPEC_AUGMENT=${SPEC_AUGMENT:-0}
+FREQ_MASK=${FREQ_MASK:-8}
+TIME_MASK=${TIME_MASK:-24}
+NUM_EPOCHS=${EPOCHS:-60}
+LR=${LR:-3e-4}
+
 [ $# -gt 0 ] && shift
 
 for kv in "$@"; do
@@ -17,31 +21,35 @@ for kv in "$@"; do
 done
 
 FRONTENDS=${FRONTENDS:-"mfcc mel cqt sincnet leaf"}
+# FRONTENDS=${FRONTENDS:-"cqt"}
 
 export MODEL
+export SPEC_AUGMENT
 
-export POOL=${POOL:-attn}
-export LOSS=${LOSS:-ce}
+export POOL
+export LOSS
 
 
-export NUM_EPOCHS=${NUM_EPOCHS:-30}
+export NUM_EPOCHS
 
-export BATCH_SIZE=${BATCH_SIZE:-5}
-export LR=${LR:-3e-4}
+export BATCH_SIZE=${BATCH_SIZE:-32}
+export LR
 export SEED=${SEED:-99}
 export TARGET_SIZE=${TARGET_SIZE:-128}
 export PATCH=${PATCH:-8}
 export DIM=${DIM:-256}
-export DEPTH=${DEPTH:-6}
+export DEPTH
 export HEADS=${HEADS:-8}
 export MLP_DIM=${MLP_DIM:-1024}
 export ATT_HEADS=${ATT_HEADS:-5}
 export IEMOCAP_CLASSES=${IEMOCAP_CLASSES:-4}
 export CV_FOLDS=${CV_FOLDS:-0}
-export FIXED_SECONDS=${FIXED_SECONDS:-3}
+export FIXED_SECONDS=${FIXED_SECONDS:-5}
 export COORD_CHANNELS=${COORD_CHANNELS:-1}
 export NORMALIZE=${NORMALIZE:-1}
 export PCEN=${PCEN:-1}
+export FREQ_MASK
+export TIME_MASK
 
 cd "$(dirname "$0")"
 
